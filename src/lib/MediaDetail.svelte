@@ -21,11 +21,23 @@ let activeTab = '';
 let availableTabs = [];
 let viewMode = 'list'; // 'list' or 'grid'
 
+$: {
+  if (media) {
+    // Ensure media_type is set
+    if (!media.media_type) {
+      media.media_type = media.title ? 'movie' : 'tv';
+    }
+  }
+}
+
 $: isInMyList = media && $myListStore.some(item => 
   item.id === media.id && item.media_type === media.media_type
 );
+
 $: {
-  if (media) console.log('🎥 MediaDetail: isInMyList updated for', media.title || media.name, ':', isInMyList);
+  if (media && isInMyList !== undefined) {
+    console.log('🎥 MediaDetail: isInMyList updated for', media.title || media.name, ':', isInMyList);
+  }
 }
 
 $: if (media) {
@@ -156,7 +168,13 @@ async function loadRecommendations() {
     } else {
       response = await getTVRecommendations(media.id);
     }
-    recommendations = response?.results?.slice(0, 10) || [];
+    recommendations = (response?.results?.slice(0, 10) || []).map(rec => {
+      // Ensure media_type is set for recommendations
+      if (!rec.media_type) {
+        rec.media_type = media.media_type === 'movie' || media.title ? 'movie' : 'tv';
+      }
+      return rec;
+    });
   } catch (err) {
     console.error('Error loading recommendations:', err);
   }

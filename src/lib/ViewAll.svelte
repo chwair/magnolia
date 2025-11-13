@@ -62,11 +62,19 @@ async function loadItems() {
     }
 
     if (response?.results) {
+      // Ensure media_type is set for all items
+      const resultsWithType = response.results.map(item => {
+        if (!item.media_type) {
+          item.media_type = type === 'tv' ? 'tv' : 'movie';
+        }
+        return item;
+      });
+      
       if (page === 1) {
-        items = response.results;
+        items = resultsWithType;
       } else {
         const existingIds = new Set(items.map(item => item.id));
-        const newItems = response.results.filter(item => !existingIds.has(item.id));
+        const newItems = resultsWithType.filter(item => !existingIds.has(item.id));
         items = [...items, ...newItems];
       }
       totalPages = response.total_pages || 1;
@@ -86,6 +94,10 @@ function loadMore() {
 }
 
 function openDetail(item) {
+  // Ensure media_type is set before dispatching
+  if (!item.media_type) {
+    item.media_type = type === 'tv' ? 'tv' : 'movie';
+  }
   onClose();
   window.dispatchEvent(new CustomEvent('openMediaDetail', { detail: item }));
 }
@@ -96,6 +108,10 @@ function isInMyList(item) {
 
 function toggleMyList(event, item) {
   event.stopPropagation();
+  // Ensure media_type is set before adding to list
+  if (!item.media_type) {
+    item.media_type = type === 'tv' ? 'tv' : 'movie';
+  }
   console.log('📋 ViewAll: Toggle for:', item.title || item.name);
   myListStore.toggleItem(item);
 }

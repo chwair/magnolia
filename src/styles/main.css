@@ -180,7 +180,7 @@ pre {
 .logo {
     width: 28px;
     height: 28px;
-    background-image: url("src/media/magnolia.png");
+    background-image: url("/src/media/magnolia.png");
     background-repeat: no-repeat;
     background-size: contain;
     background-position: center;

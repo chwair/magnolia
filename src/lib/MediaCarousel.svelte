@@ -67,7 +67,13 @@ onMount(async () => {
     } else if (category === 'now_playing') {
       response = await getNowPlaying();
     }
-    items = response?.results || [];
+    items = (response?.results || []).map(item => {
+      // Ensure media_type is set if not already present
+      if (!item.media_type) {
+        item.media_type = type === 'tv' ? 'tv' : 'movie';
+      }
+      return item;
+    });
     loading = false;
 
     items.forEach(item => {
@@ -181,6 +187,10 @@ cardColors = cardColors;
 }
 
 function openDetail(item) {
+  // Ensure media_type is set before dispatching
+  if (!item.media_type) {
+    item.media_type = type === 'tv' ? 'tv' : 'movie';
+  }
   window.dispatchEvent(new CustomEvent('openMediaDetail', { detail: item }));
 }
 
@@ -191,6 +201,10 @@ function isInMyList(item) {
 
 function toggleMyList(event, item) {
   event.stopPropagation();
+  // Ensure media_type is set before adding to list
+  if (!item.media_type) {
+    item.media_type = type === 'tv' ? 'tv' : 'movie';
+  }
   console.log('🔘 Toggle button clicked for:', item.title || item.name);
   myListStore.toggleItem(item);
 }function handleViewAll() {
