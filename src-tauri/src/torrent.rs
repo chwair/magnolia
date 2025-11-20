@@ -46,8 +46,8 @@ pub struct SubtitleTrack {
 pub struct Chapter {
     pub index: usize,
     pub title: Option<String>,
-    pub start_time: f64, // seconds
-    pub end_time: f64,   // seconds
+    pub start_time: f64,
+    pub end_time: f64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -68,6 +68,7 @@ pub struct TorrentInfo {
     pub upload_speed: u64,
     pub peers: usize,
     pub is_paused: bool,
+    pub state: String, // "checking", "downloading", "paused", "live"
 }
 
 #[derive(Clone, Serialize)]
@@ -76,6 +77,17 @@ pub struct StreamInfo {
     pub file_name: String,
     pub file_size: u64,
     pub metadata: Option<MkvMetadata>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct StreamStatus {
+    pub status: String, // "initializing", "ready", "error"
+    pub progress_bytes: u64,
+    pub total_bytes: u64,
+    pub peers: usize,
+    pub download_speed: u64,
+    pub stream_info: Option<StreamInfo>,
+    pub state: String, // "checking", "downloading"
 }
 
 #[derive(Clone)]
@@ -91,7 +103,7 @@ struct TorrentEntry {
 pub struct TorrentManager {
     session: Arc<Session>,
     download_dir: PathBuf,
-    torrents: Arc<RwLock<HashMap<usize, TorrentEntry>>>, // our_id -> torrent entry
+    torrents: Arc<RwLock<HashMap<usize, TorrentEntry>>>,
     next_id: Arc<RwLock<usize>>,
     http_addr: SocketAddr,
 }
@@ -137,11 +149,15 @@ async fn stream_file(
 
     let mut stream = match handle.stream(file_id) {
         Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to stream: {}", e)).into_response(),
+        Err(e) => {
+            tracing::error!("Failed to create stream for file_id {}: {}", file_id, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to stream: {}", e)).into_response();
+        }
     };
 
     if start > 0 {
         if let Err(e) = stream.seek(SeekFrom::Start(start)).await {
+            tracing::error!("Failed to seek stream to {}: {}", start, e);
             return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to seek: {}", e)).into_response();
         }
     }
@@ -170,7 +186,7 @@ impl TorrentManager {
     pub async fn new(download_dir: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&download_dir)?;
 
-        // Create session with default options - Session::new() handles DHT, persistence, etc.
+        // Create session with default options
         let session = Session::new(download_dir.clone())
             .await
             .context("Failed to create librqbit session")?;
@@ -320,6 +336,7 @@ impl TorrentManager {
                         upload_speed: 0,
                         peers: 0,
                         is_paused: true,
+                        state: "paused".to_string(),
                     });
                 }
                 _ => {
@@ -368,6 +385,16 @@ impl TorrentManager {
 
         let torrent_name = handle.name().unwrap_or_else(|| "Unknown".to_string());
         let stats = handle.stats();
+        let is_paused = handle.is_paused();
+        
+        // Determine state: when stats.live is None, torrent is checking/hashing
+        let state = if is_paused {
+            "paused".to_string()
+        } else if stats.live.is_none() {
+            "checking".to_string()
+        } else {
+            "live".to_string()
+        };
 
         Ok(TorrentInfo {
             handle_id,
@@ -390,7 +417,8 @@ impl TorrentManager {
                 .map(|l| l.upload_speed.mbps as u64)
                 .unwrap_or(0),
             peers: stats.live.as_ref().map(|l| l.snapshot.peer_stats.live).unwrap_or(0),
-            is_paused: handle.is_paused(),
+            is_paused,
+            state,
         })
     }
 
@@ -407,14 +435,13 @@ impl TorrentManager {
         Ok(result)
     }
 
-    pub async fn start_stream(&self, handle_id: usize, file_index: usize) -> Result<StreamInfo> {
+    pub async fn prepare_stream(&self, handle_id: usize, file_index: usize) -> Result<()> {
         let torrents = self.torrents.read().await;
         let entry = torrents
             .get(&handle_id)
             .context("Torrent handle not found")?;
         
         // Add the torrent with ONLY the specific file selected
-        // This prevents librqbit from downloading anything else
         let add_torrent = if entry.magnet_url.starts_with("magnet:") {
             AddTorrent::from_url(&entry.magnet_url)
         } else if entry.magnet_url.starts_with("http") {
@@ -423,17 +450,18 @@ impl TorrentManager {
             AddTorrent::from_local_filename(&entry.magnet_url)?
         };
         
-        tracing::info!("Starting stream for file index {} - file will be downloaded fully", file_index);
+        tracing::info!("Preparing stream for file index {}", file_index);
         
         let opts = AddTorrentOptions {
             overwrite: true,
             paused: false,
             only_files: Some(vec![file_index]),
+            force_tracker_interval: Some(std::time::Duration::from_secs(5)), // Request peers faster
             ..Default::default()
         };
         
         let response = self.session.add_torrent(add_torrent, Some(opts)).await?;
-        let (session_id, handle) = match response {
+        let (session_id, _handle) = match response {
             AddTorrentResponse::Added(id, h) => (id, h),
             AddTorrentResponse::AlreadyManaged(id, h) => {
                 tracing::info!("Torrent already managed, reusing existing download");
@@ -452,8 +480,21 @@ impl TorrentManager {
         if let Some(entry) = torrents.get_mut(&handle_id) {
             entry.session_id = Some(session_id);
         }
-        drop(torrents);
+        
+        Ok(())
+    }
 
+    pub async fn get_stream_status(&self, handle_id: usize, file_index: usize) -> Result<StreamStatus> {
+        let torrents = self.torrents.read().await;
+        let entry = torrents
+            .get(&handle_id)
+            .context("Torrent handle not found")?;
+            
+        let session_id = entry.session_id.context("Torrent not yet added to session")?;
+        
+        let handle = self.session.get(TorrentIdOrHash::Id(session_id)).context("Session torrent not found")?;
+        let stats = handle.stats();
+        
         let file_info = handle.with_metadata(|meta| {
             meta.file_infos.get(file_index).map(|fi| (
                 fi.relative_filename.clone(),
@@ -468,50 +509,65 @@ impl TorrentManager {
             .unwrap_or("unknown")
             .to_string();
 
-        tracing::info!("Stream ready: {} ({} bytes)", file_name, file_size);
+        // Check if ready
+        // We need to ensure:
+        // 1. The stream can be created (handle.stream succeeds)
+        // 2. We have enough data for headers (at least 2MB or finished)
+        let is_streamable = handle.stream(file_index).is_ok();
+        let has_buffer = stats.progress_bytes > 2 * 1024 * 1024 || stats.finished;
         
-        // Extract MKV metadata if it's an MKV file and already downloaded
-        let metadata = if file_name.to_lowercase().ends_with(".mkv") {
-            let stats = handle.stats();
-            
-            // Check if file is already fully downloaded
-            if stats.progress_bytes >= stats.total_bytes && stats.total_bytes > 0 {
-                tracing::info!("MKV file already complete, extracting metadata...");
-                let file_path = self.download_dir.join(&file_name_path);
-                
-                match extract_mkv_metadata(&file_path).await {
-                    Ok(metadata) => {
-                        tracing::info!("Successfully extracted MKV metadata: {} audio tracks, {} subtitle tracks, {} chapters",
-                            metadata.audio_tracks.len(),
-                            metadata.subtitle_tracks.len(),
-                            metadata.chapters.len()
-                        );
-                        Some(metadata)
-                    },
-                    Err(e) => {
-                        tracing::warn!("Failed to extract MKV metadata: {}", e);
-                        None
-                    }
+        let is_ready = is_streamable && has_buffer;
+        
+        if !is_ready {
+            tracing::debug!(
+                "Stream not ready: streamable={}, buffer={} ({} bytes), finished={}", 
+                is_streamable, has_buffer, stats.progress_bytes, stats.finished
+            );
+        }
+        
+        let stream_info = if is_ready {
+             // Extract MKV metadata if it's an MKV file and already downloaded
+            let metadata = if file_name.to_lowercase().ends_with(".mkv") {
+                // Check if file is already fully downloaded
+                if stats.progress_bytes >= stats.total_bytes && stats.total_bytes > 0 {
+                    let file_path = self.download_dir.join(&file_name_path);
+                    extract_mkv_metadata(&file_path).await.ok()
+                } else {
+                    None
                 }
             } else {
-                tracing::info!("MKV file not yet complete ({}/{}), starting stream without metadata",
-                    stats.progress_bytes, stats.total_bytes);
                 None
-            }
+            };
+
+            Some(StreamInfo {
+                url: format!(
+                    "http://{}/torrents/{}/stream/{}",
+                    self.http_addr,
+                    session_id,
+                    file_index
+                ),
+                file_name,
+                file_size,
+                metadata,
+            })
         } else {
             None
         };
-        
-        Ok(StreamInfo {
-            url: format!(
-                "http://{}/torrents/{}/stream/{}",
-                self.http_addr,
-                session_id,
-                file_index
-            ),
-            file_name,
-            file_size,
-            metadata,
+
+        let state = if stats.live.is_none() {
+            "checking".to_string()
+        } else {
+            "downloading".to_string()
+        };
+
+        Ok(StreamStatus {
+            status: if is_ready { "ready".to_string() } else { "initializing".to_string() },
+            progress_bytes: stats.progress_bytes,
+            total_bytes: stats.total_bytes,
+            peers: stats.live.as_ref().map(|l| l.snapshot.peer_stats.live).unwrap_or(0),
+            download_speed: stats.live.as_ref().map(|l| l.download_speed.mbps as u64).unwrap_or(0),
+            stream_info,
+            state,
         })
     }
     
@@ -567,6 +623,20 @@ impl TorrentManager {
 
     pub fn get_download_dir(&self) -> PathBuf {
         self.download_dir.clone()
+    }
+
+    pub async fn cleanup_all(&self) -> Result<()> {
+        tracing::info!("Cleaning up all torrents on app close");
+        let torrents = self.torrents.read().await;
+        let handles: Vec<usize> = torrents.keys().copied().collect();
+        drop(torrents);
+
+        for handle_id in handles {
+            if let Err(e) = self.stop_stream(handle_id, true).await {
+                tracing::error!("Error stopping torrent {}: {}", handle_id, e);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -655,13 +725,25 @@ pub async fn list_torrents(
 }
 
 #[tauri::command]
-pub async fn start_stream(
+pub async fn prepare_stream(
     manager: State<'_, Arc<TorrentManager>>,
     handle_id: usize,
     file_index: usize,
-) -> Result<StreamInfo, String> {
+) -> Result<(), String> {
     manager
-        .start_stream(handle_id, file_index)
+        .prepare_stream(handle_id, file_index)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_stream_status(
+    manager: State<'_, Arc<TorrentManager>>,
+    handle_id: usize,
+    file_index: usize,
+) -> Result<StreamStatus, String> {
+    manager
+        .get_stream_status(handle_id, file_index)
         .await
         .map_err(|e| e.to_string())
 }

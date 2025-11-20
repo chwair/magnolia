@@ -1,6 +1,7 @@
 <script>
   import { searchMulti, getImageUrl } from './tmdb.js';
   import { onMount } from 'svelte';
+  import { getRatingClass } from './utils/colorUtils.js';
   
   export let searchActive = false;
   let searchQuery = '';
@@ -47,7 +48,8 @@
     const handleKeyDown = (e) => {
       if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
         e.preventDefault();
-        searchInput?.focus();
+        try { searchInput?.focus({ preventScroll: true }); }
+        catch (err) { searchInput?.focus(); }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -82,6 +84,19 @@
     searchTimeout = setTimeout(performSearch, 150);
   }
 
+  function handleMouseDown(e) {
+    // Prevent the browser from scrolling the page to the input when clicked
+    // (especially important for sticky/floating header layouts)
+    e.preventDefault();
+    // Use preventScroll when available to avoid scrolling the page
+    try {
+      searchInput?.focus({ preventScroll: true });
+    } catch (err) {
+      // Older browsers may not support preventScroll - fallback to normal focus
+      searchInput?.focus();
+    }
+  }
+
   function handleFocus() {
     if (searchQuery.length === 0 && recentSearches.length > 0) {
       showRecent = true;
@@ -102,6 +117,8 @@
     } else if (e.key === 'Enter' && selectedIndex >= 0) {
       e.preventDefault();
       const item = showRecent ? recentSearches[selectedIndex] : searchResults[selectedIndex];
+      // Blur the input so it's deselected when opening via keyboard
+      try { searchInput?.blur(); } catch (err) { /* ignore */ }
       openDetail(item);
     } else if (e.key === 'Escape') {
       searchActive = false;
@@ -127,14 +144,7 @@
     return rating ? rating.toFixed(1) : 'N/A';
   }
   
-  function getRatingColor(rating) {
-    if (rating >= 9) return '#00ff00';
-    if (rating >= 8) return '#8bc34a';
-    if (rating >= 7) return '#ffc107';
-    if (rating >= 6) return '#ff9800';
-    if (rating >= 5) return '#ff5722';
-    return '#f44336';
-  }
+  // getRatingColor replaced by getRatingClass in src/lib/utils/colorUtils.js
 
   function openDetail(item) {
     const exists = recentSearches.findIndex(s => s.id === item.id && s.media_type === item.media_type);
@@ -145,10 +155,24 @@
     recentSearches = recentSearches.slice(0, 5);
     localStorage.setItem('recentSearches', JSON.stringify(recentSearches));
 
+    // window opens detail; to avoid layout shift when selecting via keyboard
+    // delay hiding the results until navigation works in the parent. This avoids
+    // the 'floating' results bar and content jump when openMediaDetail triggers.
     window.dispatchEvent(new CustomEvent('openMediaDetail', { detail: item }));
-    searchActive = false;
+    // Hide search after the event has been handled by listeners (most notably App.svelte)
+    // We use requestAnimationFrame twice to allow DOM updates to flush and avoid a measured
+    // reflow that could cause the search results to float.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      searchActive = false;
+      showRecent = false;
+      selectedIndex = -1;
+    }));
+  }
+
+  function clearRecentSearches() {
+    recentSearches = [];
+    localStorage.removeItem('recentSearches');
     showRecent = false;
-    selectedIndex = -1;
   }
 </script>
 
@@ -164,6 +188,7 @@
       on:input={handleInput}
       on:focus={handleFocus}
       on:keydown={handleKeyDown}
+      on:mousedown={handleMouseDown}
       class="search-input"
     />
     {#if !searchActive && searchQuery.length === 0}
@@ -172,10 +197,15 @@
       </div>
     {/if}
   </div>
-  {#if searchActive}
-    <div class="search-results" bind:this={searchResultsContainer}>
+  <div class="search-results" bind:this={searchResultsContainer} class:visible={searchActive} aria-hidden={!searchActive}>
       {#if showRecent && recentSearches.length > 0}
-        <div class="results-header">Recent Searches</div>
+        <div class="results-header">
+          <span>Recent Searches</span>
+          <button class="clear-recent-btn" on:click={clearRecentSearches} title="Clear recent searches">
+            <i class="ri-close-line"></i>
+            Clear
+          </button>
+        </div>
         {#each recentSearches as result, index}
           <!-- svelte-ignore a11y-click-events-have-key-events -->
           <!-- svelte-ignore a11y-no-static-element-interactions -->
@@ -198,7 +228,7 @@
                   <span>{(result.release_date || result.first_air_date).split('-')[0]}</span>
                 {/if}
                 {#if result.vote_average}
-                  <span class="rating-badge" style="background-color: {getRatingColor(result.vote_average)}">
+                  <span class="rating-badge {getRatingClass(result.vote_average)}">
                     {formatRating(result.vote_average)}
                   </span>
                 {/if}
@@ -231,7 +261,7 @@
                   <span>{(result.release_date || result.first_air_date).split('-')[0]}</span>
                 {/if}
                 {#if result.vote_average}
-                  <span class="rating-badge" style="background-color: {getRatingColor(result.vote_average)}">
+                  <span class="rating-badge {getRatingClass(result.vote_average)}">
                     {formatRating(result.vote_average)}
                   </span>
                 {/if}
@@ -243,119 +273,4 @@
         <div class="results-placeholder">No results found</div>
       {/if}
     </div>
-  {/if}
 </div>
-
-<style>
-  .search-wrapper {
-    flex: 1;
-    max-width: 700px;
-    position: relative;
-  }
-
-  .search-wrapper.expanded {
-    max-width: 700px;
-  }
-
-  .search-container {
-    position: relative;
-  }
-
-  .search-input {
-    width: 100%;
-    padding: 8px 16px;
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    border-radius: 24px;
-    color: rgba(255, 255, 255, 0.87);
-    font-size: 12px;
-    font-family: inherit;
-    outline: none;
-    transition: all 0.3s ease;
-    box-shadow: 
-      inset -2px -2px 4px rgba(255, 255, 255, 0.02),
-      inset 2px 2px 4px rgba(0, 0, 0, 0.3),
-      -2px -2px 4px rgba(255, 255, 255, 0.02),
-      2px 2px 4px rgba(0, 0, 0, 0.4);
-  }
-
-  .search-wrapper.expanded .search-input {
-    background: rgba(255, 255, 255, 0.08);
-    border-color: rgba(255, 255, 255, 0.1);
-    border-radius: 16px 16px 0 0;
-    box-shadow: 
-      inset -2px -2px 4px rgba(255, 255, 255, 0.03),
-      inset 2px 2px 4px rgba(0, 0, 0, 0.4),
-      -4px -4px 12px rgba(255, 255, 255, 0.03),
-      4px 4px 16px rgba(0, 0, 0, 0.6);
-  }
-
-  .search-input::placeholder {
-    color: rgba(255, 255, 255, 0.3);
-  }
-
-  .search-input:focus {
-    background: rgba(255, 255, 255, 0.05);
-    border-color: rgba(255, 255, 255, 0.1);
-    box-shadow: 
-      inset -2px -2px 4px rgba(255, 255, 255, 0.03),
-      inset 2px 2px 4px rgba(0, 0, 0, 0.4),
-      -3px -3px 8px rgba(255, 255, 255, 0.03),
-      3px 3px 8px rgba(0, 0, 0, 0.5);
-  }
-
-  .search-results {
-    position: absolute;
-    top: 100%;
-    left: 0;
-    right: 0;
-    background: rgba(10, 10, 10, 0.98);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-top: none;
-    border-radius: 0 0 16px 16px;
-    max-height: 400px;
-    overflow-y: auto;
-    backdrop-filter: blur(20px);
-    box-shadow: 
-      -4px 4px 12px rgba(255, 255, 255, 0.02),
-      4px 4px 20px rgba(0, 0, 0, 0.6);
-    animation: slideDown 0.3s ease;
-    z-index: 1001;
-  }
-
-  @keyframes slideDown {
-    from {
-      opacity: 0;
-      transform: translateY(-10px);
-    }
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-
-  .results-placeholder {
-    color: rgba(255, 255, 255, 0.4);
-    font-size: 14px;
-    text-align: center;
-    margin: 0;
-  }
-
-  .search-results::-webkit-scrollbar {
-    width: 8px;
-  }
-
-  .search-results::-webkit-scrollbar-track {
-    background: rgba(255, 255, 255, 0.02);
-    border-radius: 4px;
-  }
-
-  .search-results::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 4px;
-  }
-
-  .search-results::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.15);
-  }
-</style>

@@ -1,14 +1,16 @@
 <script>
-import { onMount } from 'svelte';
+import { onMount, createEventDispatcher } from 'svelte';
 import { getTrending, getPopularMovies, getPopularTV, getTopRatedMovies, getTopRatedTV, getNowPlaying, discoverTV, getImageUrl } from './tmdb.js';
 import { myListStore } from './stores/listStore.js';
+import { getRatingClass } from './utils/colorUtils.js';
+
+const dispatch = createEventDispatcher();
 
 export let title = '';
 export let type = 'movie';
 export let category = 'popular';
 export let genre = null;
 export let customItems = null;
-export let onClose = () => {};
 
 let items = [];
 let loading = true;
@@ -23,7 +25,7 @@ onMount(async () => {
   const handleMouseButton = (e) => {
     if (e.button === 3) { // Back button
       e.preventDefault();
-      onClose();
+      dispatch('close');
     }
   };
   
@@ -98,7 +100,7 @@ function openDetail(item) {
   if (!item.media_type) {
     item.media_type = type === 'tv' ? 'tv' : 'movie';
   }
-  onClose();
+  dispatch('close');
   window.dispatchEvent(new CustomEvent('openMediaDetail', { detail: item }));
 }
 
@@ -121,20 +123,13 @@ function formatDate(dateString) {
   return new Date(dateString).getFullYear();
 }
 
-function getRatingColor(rating) {
-  if (rating >= 9) return '#5fedd8';  // Aqua green (9-10)
-  if (rating >= 8) return '#6bdb8f';  // Green (8-9)
-  if (rating >= 7) return '#f5d95a';  // Yellow (7-8)
-  if (rating >= 6) return '#ffa368';  // Orange (6-7)
-  if (rating >= 5) return '#ff6b6b';  // Red (5-6)
-  return '#d65db1';  // Purplish red (0-5)
-}
+// getRatingColor replaced by getRatingClass in src/lib/utils/colorUtils.js
 </script>
 
 <div class="view-all-overlay">
   <div class="view-all-container">
     <div class="view-all-header">
-      <button class="btn-standard back-btn" on:click={onClose}>
+      <button class="btn-standard back-btn" on:click={() => dispatch('close')}>
         <i class="ri-arrow-left-line"></i>
         Back
       </button>
@@ -162,7 +157,7 @@ function getRatingColor(rating) {
             
             {#if item.vote_average > 0}
               <div class="grid-card-rating">
-                <span class="rating-badge" style="background-color: {getRatingColor(item.vote_average)}">
+                <span class="rating-badge {getRatingClass(item.vote_average)}">
                   {item.vote_average.toFixed(1)}
                 </span>
               </div>
@@ -174,7 +169,7 @@ function getRatingColor(rating) {
                 <div class="grid-card-meta">
                   <span class="year">{formatDate(item.release_date || item.first_air_date)}</span>
                   {#if item.vote_average > 0}
-                    <span class="rating-badge" style="background-color: {getRatingColor(item.vote_average)}">
+                    <span class="rating-badge {getRatingClass(item.vote_average)}">
                       {item.vote_average.toFixed(1)}
                     </span>
                   {/if}

@@ -18,21 +18,21 @@ export class MKVDemuxer {
 
   async initialize(src) {
     try {
-      // Use absolute URL for WASM file so it works in worker context
+      // Use absolute URL for WASM file
       const wasmUrl = new URL('/web-demuxer.wasm', window.location.origin).href;
       console.log('WASM URL:', wasmUrl);
-      
+
       this.demuxer = new WebDemuxer({
         wasmFilePath: wasmUrl
       });
 
       await this.demuxer.load(src);
-      
+
       this.mediaInfo = await this.demuxer.getMediaInfo();
       console.log('Web-Demuxer Media Info:', this.mediaInfo);
-      
+
       await this.processMediaInfo();
-      
+
       const info = {
         duration: this.mediaInfo.duration,
         videoTrack: this.videoTrack,
@@ -40,11 +40,11 @@ export class MKVDemuxer {
         subtitleTracks: this.subtitleTracks,
         chapters: this.chapters
       };
-      
+
       if (this.onReady) {
         this.onReady(info);
       }
-      
+
       return info;
     } catch (error) {
       console.error('Failed to initialize web-demuxer:', error);
@@ -116,12 +116,12 @@ export class MKVDemuxer {
 
     try {
       const reader = this.videoStream.getReader();
-      
+
       while (true) {
         const { done, value } = await reader.read();
-        
+
         if (done) break;
-        
+
         if (this.onVideoSamples) {
           this.onVideoSamples([value]);
         }
@@ -136,12 +136,12 @@ export class MKVDemuxer {
 
     try {
       const reader = stream.getReader();
-      
+
       while (true) {
         const { done, value } = await reader.read();
-        
+
         if (done) break;
-        
+
         if (this.onAudioSamples) {
           this.onAudioSamples(trackId, [value]);
         }
@@ -173,9 +173,9 @@ export class MKVDemuxer {
 
   async seek(time) {
     if (!this.demuxer) return;
-    
+
     this.stop();
-    
+
     if (this.videoTrack) {
       this.videoStream = this.demuxer.read('video', time);
       this.readVideoStream();
@@ -192,7 +192,7 @@ export class MKVDemuxer {
 
   destroy() {
     this.stop();
-    
+
     if (this.demuxer) {
       this.demuxer.destroy();
       this.demuxer = null;

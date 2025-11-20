@@ -20,13 +20,19 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+
 librqbit = "8.1.1"
 axum = { version = "0.8", features = ["http2"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tokio-util = { version = "0.7", features = ["io"] }
+
 matroska = "0.18"
-bytes = "1"
+reqwest = { version = "0.11", features = ["json"] }
+scraper = "0.18"
+async-trait = "0.1"
+serde_bencode = "0.2"
+regex = "1.10"
+
 
 [features]
 # this feature is used for production builds or when `devPath` points to the filesystem
@@ -34,4 +40,4 @@ bytes = "1"
 custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
-hex-literal = "1.1.0"
+

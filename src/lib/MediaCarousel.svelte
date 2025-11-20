@@ -1,7 +1,10 @@
 <script>
-import { onMount, afterUpdate } from 'svelte';
+import { onMount, afterUpdate, onDestroy, createEventDispatcher } from 'svelte';
 import { getTrending, getPopularMovies, getPopularTV, getTopRatedMovies, getTopRatedTV, getNowPlaying, discoverTV, getImageUrl } from './tmdb.js';
 import { myListStore } from './stores/listStore.js';
+import { getRatingClass } from './utils/colorUtils.js';
+
+const dispatch = createEventDispatcher();
 
 export let title = 'Section Title';
 export let type = 'movie';
@@ -9,6 +12,7 @@ export let category = 'popular';
 export let genre = null;
 export let accentColor = '#6366f1';
 export let customItems = null;
+export let showClearButton = false;
 
 let items = [];
 let loading = true;
@@ -88,6 +92,20 @@ onMount(async () => {
   }
 });
 
+// Keep arrows in sync with window resizing so visibility toggles
+// when the viewport changes (e.g. responsive layout).
+function handleResize() {
+  updateArrows();
+}
+
+onMount(() => {
+  window.addEventListener('resize', handleResize);
+});
+
+onDestroy(() => {
+  window.removeEventListener('resize', handleResize);
+});
+
 afterUpdate(() => {
 updateArrows();
 });
@@ -102,14 +120,7 @@ const date = new Date(dateStr);
 return date.getFullYear();
 }
 
-function getRatingColor(rating) {
-if (rating >= 9) return '#5fedd8';  // Aqua green (9-10)
-if (rating >= 8) return '#6bdb8f';  // Green (8-9)
-if (rating >= 7) return '#f5d95a';  // Yellow (7-8)
-if (rating >= 6) return '#ffa368';  // Orange (6-7)
-if (rating >= 5) return '#ff6b6b';  // Red (5-6)
-return '#d65db1';  // Purplish red (0-5)
-}
+// getRatingColor was moved to `src/lib/utils/colorUtils.js`. Use getRatingClass to apply semantic classes.
 
 function updateArrows() {
 if (!carouselElement) return;
@@ -222,7 +233,15 @@ function toggleMyList(event, item) {
 <div class="carousel-section">
 <div class="section-header">
 <h2 class="section-title">{title}</h2>
-<button class="btn-standard view-all" on:click={handleViewAll}>View All →</button>
+<div class="header-actions">
+  {#if showClearButton}
+    <button class="btn-standard clear-btn" on:click={() => dispatch('clear')} title="Clear history">
+      <i class="ri-delete-bin-line"></i>
+      Clear
+    </button>
+  {/if}
+  <button class="btn-standard view-all" on:click={handleViewAll}>View All →</button>
+</div>
 </div>
 {#if loading}
 <div class="loading">Loading...</div>
@@ -230,7 +249,7 @@ function toggleMyList(event, item) {
 <div class="error">Error: {error}</div>
 {:else}
     <div class="carousel-container" class:show-left-gradient={showLeftArrow} class:show-right-gradient={showRightArrow}>
-      <button class="carousel-arrow left" class:visible={showLeftArrow} on:click={() => scroll('left')}>
+      <button class="carousel-arrow left" class:visible={showLeftArrow} on:click={() => scroll('left')} aria-label="Scroll left">
         <i class="ri-arrow-left-s-line"></i>
       </button>
       <div class="carousel" bind:this={carouselElement} on:scroll={updateArrows}>
@@ -246,7 +265,7 @@ function toggleMyList(event, item) {
 <h3 class="media-title">{item.title || item.name}</h3>
 <div class="media-meta">
 <span>{formatDate(item.release_date || item.first_air_date)}</span>
-<span class="rating-badge" style="background-color: {getRatingColor(item.vote_average)}">
+<span class="rating-badge {getRatingClass(item.vote_average)}">
 {formatRating(item.vote_average)}
 </span>
 </div>
@@ -267,7 +286,7 @@ function toggleMyList(event, item) {
 </div>
 {/each}
 </div>
-<button class="carousel-arrow right" class:visible={showRightArrow} on:click={() => scroll('right')}>
+<button class="carousel-arrow right" class:visible={showRightArrow} on:click={() => scroll('right')} aria-label="Scroll right">
 <i class="ri-arrow-right-s-line"></i>
 </button>
 </div>

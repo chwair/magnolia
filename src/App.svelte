@@ -1,12 +1,15 @@
 <script>
-  import { onMount } from 'svelte';
-  import TitleBar from './lib/TitleBar.svelte';
-  import MediaCarousel from './lib/MediaCarousel.svelte';
-  import MediaDetail from './lib/MediaDetail.svelte';
-  import ViewAll from './lib/ViewAll.svelte';
-  import RecommendationsCarousel from './lib/RecommendationsCarousel.svelte';
-  import TorrentDebug from './lib/TorrentDebug.svelte';
-  import { myListStore } from './lib/stores/listStore.js';
+  import { onMount } from "svelte";
+  import TitleBar from "./lib/TitleBar.svelte";
+  import MediaCarousel from "./lib/MediaCarousel.svelte";
+  import MediaDetail from "./lib/MediaDetail.svelte";
+  import ViewAll from "./lib/ViewAll.svelte";
+  import RecommendationsCarousel from "./lib/RecommendationsCarousel.svelte";
+  import TorrentDebug from "./lib/TorrentDebug.svelte";
+  import VideoPlayer from "./lib/VideoPlayer.svelte";
+  import { myListStore } from "./lib/stores/listStore.js";
+  import { watchHistoryStore } from "./lib/stores/watchHistoryStore.js";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
 
   let searchActive = false;
   let selectedMedia = null;
@@ -15,38 +18,64 @@
   let mediaHistory = [];
   let historyIndex = -1;
   let showTorrentDebug = false;
-  
+  let savedScrollPosition = 0;
+
+  // Video Player State
+  let showVideoPlayer = false;
+  let videoPlayerProps = null;
+  let videoControlsVisible = true;
+
   $: myList = $myListStore;
+  $: watchHistory = $watchHistoryStore;
 
   onMount(() => {
-
-    window.addEventListener('openMediaDetail', (e) => {
+    window.addEventListener("openMediaDetail", (e) => {
       openMedia(e.detail);
     });
 
-    window.addEventListener('updateTitleBarColor', (e) => {
+    window.addEventListener("updateTitleBarColor", (e) => {
       titleBarAccentColor = e.detail.color;
     });
 
-    window.addEventListener('viewAll', (e) => {
+    window.addEventListener("viewAll", (e) => {
+      if (!viewAllData) {
+        const scrollContainer = document.getElementById('main-content');
+        if (scrollContainer) {
+          savedScrollPosition = scrollContainer.scrollTop;
+        }
+      }
       viewAllData = e.detail;
     });
 
-    window.addEventListener('mouseup', (e) => {
-      if (e.button === 3) { // Back button
+    window.addEventListener("openVideoPlayer", (e) => {
+      console.log("Opening video player with:", e.detail);
+      videoPlayerProps = e.detail;
+      showVideoPlayer = true;
+      videoControlsVisible = true;
+    });
+
+    window.addEventListener("videoControlsVisibility", (e) => {
+      videoControlsVisible = e.detail.visible;
+    });
+
+    window.addEventListener("mouseup", (e) => {
+      if (e.button === 3) {
+        // Back button
         e.preventDefault();
         navigateBack();
-      } else if (e.button === 4) { // Forward button
+      } else if (e.button === 4) {
+        // Forward button
         e.preventDefault();
         navigateForward();
       }
     });
 
     const handleKeyDown = (e) => {
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")
+        return;
 
-      switch(e.key) {
-        case 'Escape':
+      switch (e.key) {
+        case "Escape":
           if (viewAllData) {
             e.preventDefault();
             viewAllData = null;
@@ -56,52 +85,60 @@
           } else if (showTorrentDebug) {
             e.preventDefault();
             showTorrentDebug = false;
+          } else if (showVideoPlayer) {
+            // VideoPlayer handles its own escape usually, but we can force close if needed
+            // For now let's rely on the component's close event
           }
           break;
-        case 'ArrowLeft':
+        case "ArrowLeft":
           if (selectedMedia && (e.altKey || e.metaKey)) {
             e.preventDefault();
             navigateBack();
           }
           break;
-        case 'ArrowRight':
+        case "ArrowRight":
           if (selectedMedia && (e.altKey || e.metaKey)) {
             e.preventDefault();
             navigateForward();
           }
           break;
-        case 'Home':
-          if (!selectedMedia) {
+        case "Home":
+          if (!selectedMedia && !showVideoPlayer) {
             e.preventDefault();
-            window.scrollTo({ top: 0, behavior: 'smooth' });
+            window.scrollTo({ top: 0, behavior: "smooth" });
           }
           break;
-        case 'End':
-          if (!selectedMedia) {
+        case "End":
+          if (!selectedMedia && !showVideoPlayer) {
             e.preventDefault();
-            window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+            window.scrollTo({
+              top: document.body.scrollHeight,
+              behavior: "smooth",
+            });
           }
           break;
-        case 'D':
-          // Press Shift+D to toggle debug interface
-          if (e.shiftKey && !selectedMedia && !viewAllData) {
-            e.preventDefault();
-            showTorrentDebug = !showTorrentDebug;
-          }
-          break;
+
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown);
     return () => {
-      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener("keydown", handleKeyDown);
     };
   });
 
   function openMedia(media) {
+    if (!selectedMedia) {
+      const scrollContainer = document.getElementById('main-content');
+      if (scrollContainer) {
+        savedScrollPosition = scrollContainer.scrollTop;
+      }
+    }
     if (selectedMedia?.id !== media.id) {
       historyIndex++;
       mediaHistory = [...mediaHistory.slice(0, historyIndex), media];
+      // Add to watch history
+      watchHistoryStore.addItem(media);
     }
     selectedMedia = media;
   }
@@ -114,6 +151,12 @@
       historyIndex = -1;
       selectedMedia = null;
       titleBarAccentColor = null;
+      requestAnimationFrame(() => {
+        const scrollContainer = document.getElementById('main-content');
+        if (scrollContainer) {
+          scrollContainer.scrollTop = savedScrollPosition;
+        }
+      });
     }
   }
 
@@ -129,115 +172,163 @@
     titleBarAccentColor = null;
     historyIndex = -1;
     mediaHistory = [];
+    requestAnimationFrame(() => {
+      const scrollContainer = document.getElementById('main-content');
+      if (scrollContainer) {
+        scrollContainer.scrollTop = savedScrollPosition;
+      }
+    });
   }
 
+  function closeVideoPlayer() {
+    showVideoPlayer = false;
+    videoPlayerProps = null;
+  }
 
+  function backFromVideoPlayer() {
+    // Return to media detail that was shown before video player
+    showVideoPlayer = false;
+    videoPlayerProps = null;
+    // selectedMedia should still be set, so it will show the detail page
+  }
+
+  function closeWindow() {
+    getCurrentWindow().close();
+  }
 </script>
 
 <main>
-  <TitleBar bind:searchActive accentColor={titleBarAccentColor} />
-  
-  {#if showTorrentDebug}
-    <div class="torrent-debug-container">
-      <TorrentDebug />
-      <button class="close-debug" on:click={() => showTorrentDebug = false}>
-        ✕ Close Debug (Shift+D)
-      </button>
-    </div>
+  <div class="titlebar-wrapper" class:hidden={showVideoPlayer && !videoControlsVisible}>
+    <TitleBar 
+      bind:searchActive 
+      accentColor={showVideoPlayer ? null : titleBarAccentColor} 
+      immersive={showVideoPlayer}
+    />
+  </div>
+  {#if showVideoPlayer}
+    <VideoPlayer {...videoPlayerProps} on:close={closeVideoPlayer} on:back={backFromVideoPlayer} />
   {:else}
-    <div class="app-content" class:blur-overlay={searchActive}>
-      <div class="content">
-        <RecommendationsCarousel />
-        <MediaCarousel title="Trending Now" type="all" category="trending" />
-        {#if myList.length > 0}
-          <MediaCarousel title="My List" type="custom" customItems={myList} />
-        {/if}
-        <MediaCarousel title="Popular Movies" type="movie" category="popular" />
-        <MediaCarousel title="Popular TV Shows" type="tv" category="popular" />
-        <MediaCarousel title="Top Rated Movies" type="movie" category="top_rated" />
-        <MediaCarousel title="Top Rated TV Shows" type="tv" category="top_rated" />
-        <MediaCarousel title="Now Playing" type="movie" category="now_playing" />
-      </div>
 
+    <div class="content-scroll" id="main-content" class:blur={searchActive}>
       {#if selectedMedia}
-        <MediaDetail media={selectedMedia} onClose={closeDetail} />
-      {/if}
+        <MediaDetail media={selectedMedia} on:close={navigateBack} />
+      {:else if viewAllData}
+        <ViewAll {...viewAllData} on:close={() => { 
+          viewAllData = null; 
+          requestAnimationFrame(() => {
+            const scrollContainer = document.getElementById('main-content');
+            if (scrollContainer) {
+              scrollContainer.scrollTop = savedScrollPosition;
+            }
+          });
+        }} />
+      {:else}
+        <div class="dashboard">
+          <RecommendationsCarousel />
 
-      {#if viewAllData}
-        <ViewAll 
-          title={viewAllData.title}
-          type={viewAllData.type}
-          category={viewAllData.category}
-          genre={viewAllData.genre}
-          customItems={viewAllData.customItems}
-          onClose={() => viewAllData = null}
-        />
+          {#if watchHistory.length > 0}
+            <MediaCarousel
+              title="Recently Watched"
+              customItems={watchHistory}
+              accentColor="#10b981"
+              showClearButton={true}
+              on:clear={() => watchHistoryStore.clear()}
+            />
+          {/if}
+
+          {#if myList.length > 0}
+            <MediaCarousel
+              title="My List"
+              customItems={myList}
+              accentColor="#eab308"
+            />
+          {/if}
+
+          <MediaCarousel
+            title="Trending Movies"
+            type="movie"
+            category="trending"
+            accentColor="#f43f5e"
+          />
+
+          <MediaCarousel
+            title="Popular Movies"
+            type="movie"
+            category="popular"
+            accentColor="#ec4899"
+          />
+
+          <MediaCarousel
+            title="Top Rated Movies"
+            type="movie"
+            category="top_rated"
+            accentColor="#8b5cf6"
+          />
+
+          <MediaCarousel
+            title="Trending TV Shows"
+            type="tv"
+            category="trending"
+            accentColor="#3b82f6"
+          />
+
+          <MediaCarousel
+            title="Popular TV Shows"
+            type="tv"
+            category="popular"
+            accentColor="#06b6d4"
+          />
+        </div>
       {/if}
     </div>
+
+    {#if showTorrentDebug}
+      <TorrentDebug />
+    {/if}
   {/if}
 </main>
 
 <style>
-  :global(html) {
-    background: transparent;
-    overflow: hidden;
-  }
-
-  :global(body) {
-    margin: 0;
-    padding: 0;
-    background: transparent;
-    overflow: hidden;
-  }
-
   main {
-    width: 100vw;
     height: 100vh;
-    background: #0a0a0a;
-    border-radius: 8px;
+    width: 100vw;
     overflow: hidden;
     display: flex;
     flex-direction: column;
+    background-color: var(--bg-color);
+    color: var(--text-color);
   }
 
-  .app-content {
-    flex: 1;
+  .titlebar-wrapper {
     position: relative;
-    overflow: hidden;
+    transition: opacity 0.3s ease, transform 0.3s ease;
+    z-index: 10001;
   }
 
-  .content {
-    width: 100%;
-    height: 100%;
-    overflow-y: auto;
-    padding-top: var(--titlebar-height);
+  .titlebar-wrapper.hidden {
+    opacity: 0;
+    transform: translateY(-100%);
+  }
+  
+  .titlebar-wrapper.hidden :global(*:not(.window-controls):not(.window-controls *)) {
+    pointer-events: none;
   }
 
-  .torrent-debug-container {
+  .content-scroll {
     flex: 1;
     overflow-y: auto;
-    padding-top: var(--titlebar-height);
+    overflow-x: hidden;
     position: relative;
+    transition: filter 0.3s ease;
   }
 
-  .close-debug {
-    position: fixed;
-    top: calc(var(--titlebar-height) + 1rem);
-    right: 1rem;
-    padding: 0.75rem 1.5rem;
-    background: rgba(0, 0, 0, 0.8);
-    border: 2px solid #6366f1;
-    border-radius: 8px;
-    color: white;
-    font-weight: 600;
-    cursor: pointer;
-    backdrop-filter: blur(10px);
-    z-index: 1000;
-    transition: all 0.2s;
+  .content-scroll.blur {
+    filter: blur(8px);
+    opacity: 0.5;
+    pointer-events: none;
   }
 
-  .close-debug:hover {
-    background: #6366f1;
-    transform: scale(1.05);
+  .dashboard {
+    padding: 0 var(--spacing-xl) 40px;
   }
 </style>
