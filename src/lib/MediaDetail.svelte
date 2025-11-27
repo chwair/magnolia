@@ -11,8 +11,11 @@
     getImageUrl,
   } from "./tmdb.js";
   import { myListStore } from "./stores/listStore.js";
+  import { watchProgressStore } from "./stores/watchProgressStore.js";
+  import { getTrackerPreference, setTrackerPreference } from "./stores/watchHistoryStore.js";
   import { invoke } from "@tauri-apps/api/core";
   import TorrentSelector from "./TorrentSelector.svelte";
+  import ErrorModal from "./ErrorModal.svelte";
 
   import { createEventDispatcher } from "svelte";
 
@@ -47,6 +50,12 @@
   let availableFiles = [];
   let selectedTorrentForManual = null;
   let manualHandleId = null;
+  let autoPlayTriggered = false;
+
+  // Error modal state
+  let showErrorModal = false;
+  let errorMessage = "";
+  let errorTitle = "Error";
 
   $: {
     if (media) {
@@ -62,6 +71,12 @@
     $myListStore.some(
       (item) => item.id === media.id && item.media_type === media.media_type,
     );
+
+  // Helper function to detect anime (Animation genre ID is 16 in TMDB)
+  const isAnime = () => {
+    if (!details || !details.genres) return false;
+    return details.genres.some(genre => genre.id === 16);
+  };
 
   $: {
     if (media && isInMyList !== undefined) {
@@ -81,6 +96,7 @@
     allSeasonsData = {};
     selectedEpisode = null;
     recommendations = [];
+    autoPlayTriggered = false; // Reset autoplay flag for new media
   }
 
   $: if (details) {
@@ -111,6 +127,16 @@
   }
 
   onMount(() => {
+    // Check for autoplay after details load
+    if (media && media.autoPlay && !autoPlayTriggered) {
+      autoPlayTriggered = true;
+      setTimeout(() => {
+        if (details) {
+          handleAutoPlay();
+        }
+      }, 500);
+    }
+    
     const handleKeyDown = (e) => {
       if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")
         return;
@@ -150,6 +176,7 @@
 
   async function loadDetails() {
     loading = true;
+    details = null; // Clear previous details to prevent stale data
     try {
       if (media.media_type === "movie" || media.title) {
         details = await getMovieDetails(media.id);
@@ -159,11 +186,12 @@
         credits = await getTVCredits(media.id);
       }
 
-      if (details.backdrop_path) {
+      if (details && details.backdrop_path) {
         await extractColors(getImageUrl(details.backdrop_path, "w300"));
       }
     } catch (err) {
       console.error("Error loading details:", err);
+      details = null; // Ensure details is null on error
     }
     loading = false;
   }
@@ -357,11 +385,41 @@
 
   import { getRatingClass } from "./utils/colorUtils.js";
 
+  function showError(message, title = "Error") {
+    errorMessage = message;
+    errorTitle = title;
+    showErrorModal = true;
+  }
+
   function toggleSeason(seasonNumber) {
     if (selectedSeason === seasonNumber) {
       selectedSeason = null;
     } else {
       selectedSeason = seasonNumber;
+    }
+  }
+
+  async function handleAutoPlay() {
+    console.log('Auto-play triggered');
+    
+    // Clear autoPlay flag immediately to prevent re-triggering
+    if (media && media.autoPlay) {
+      media.autoPlay = false;
+    }
+    
+    // Use resumeProgress if passed from quick play, otherwise load from store
+    const progress = media.resumeProgress || watchProgressStore.getProgress(media.id, media.media_type);
+    
+    if (media.media_type === 'movie' || media.title) {
+      // Movie: play from beginning (timestamp resume handled by VideoPlayer)
+      await handlePlay(0, 0);
+    } else if (progress && progress.currentSeason && progress.currentEpisode) {
+      // TV Show: resume from last watched episode
+      console.log(`Resuming from S${progress.currentSeason}E${progress.currentEpisode} at ${progress.currentTimestamp}s`);
+      await handlePlay(progress.currentSeason, progress.currentEpisode);
+    } else {
+      // TV Show: start from S01E01
+      await handlePlay(1, 1);
     }
   }
 
@@ -374,13 +432,6 @@
       forceReselect,
     );
     pendingPlayRequest = { season: seasonNum, episode: episodeNum };
-
-    // Helper function to detect anime
-    // Animation genre ID is 16 in TMDB for both TV and movies
-    const isAnime = () => {
-      if (!details || !details.genres) return false;
-      return details.genres.some(genre => genre.id === 16);
-    };
 
     // 1. Check persistence (skip if forcing reselect)
     if (!forceReselect) {
@@ -429,6 +480,11 @@
     const mediaType = isAnime() ? "anime" : (isMovie ? "movie" : "tv");
     console.log("Media type for search:", mediaType, "Genres:", details.genres);
 
+    // Get tracker preference
+    const storedTrackers = getTrackerPreference();
+    const trackerArray = Array.isArray(storedTrackers) && storedTrackers.length > 0 ? storedTrackers : null;
+    console.log("Tracker preference:", trackerArray);
+
     // Execute search with filtering on backend
     try {
       searchResults = await invoke("search_nyaa_filtered", {
@@ -437,6 +493,7 @@
         episode: isMovie ? null : episodeNum,
         isMovie: isMovie,
         mediaType: mediaType,
+        trackerPreference: trackerArray,
       });
 
       if (searchResults.length === 0) {
@@ -556,7 +613,7 @@
       }
     } catch (err) {
       console.error("Error processing selection:", err);
-      alert("Failed to load torrent metadata.");
+      showError("Failed to load torrent metadata. Please try again.");
     }
   }
 
@@ -567,6 +624,9 @@
         handleId = await invoke("add_torrent", { magnetOrUrl: magnetLink });
       }
 
+      // Don't update progress here - let VideoPlayer handle it to preserve saved timestamps
+      // The VideoPlayer will track progress during playback
+
       // Don't start stream here. Let VideoPlayer handle it so it can show loading screen.
       console.log("Opening player for handle:", handleId, "file:", fileIndex);
 
@@ -576,21 +636,41 @@
         ? (details.title || details.name)
         : `${details.title || details.name} - S${pendingPlayRequest.season}E${pendingPlayRequest.episode}`;
 
+      // Get saved progress for timestamp
+      const progress = watchProgressStore.getProgress(details.id, media.media_type);
+      let initialTimestamp = 0;
+      
+      // For TV shows, only use saved timestamp if we're playing the same episode
+      if (!isMovie && progress && 
+          progress.currentSeason === pendingPlayRequest.season && 
+          progress.currentEpisode === pendingPlayRequest.episode) {
+        initialTimestamp = progress.currentTimestamp || 0;
+      } else if (isMovie && progress) {
+        // For movies, always use saved timestamp
+        initialTimestamp = progress.currentTimestamp || 0;
+      }
+
       // Dispatch event to open video player
       window.dispatchEvent(
         new CustomEvent("openVideoPlayer", {
           detail: {
             src: null, // VideoPlayer will fetch this
             title: playerTitle,
-            metadata: null, // VideoPlayer will fetch this
+            metadata: details, // Pass full details for watch history
             handleId: handleId,
             fileIndex: fileIndex,
+            magnetLink: magnetLink,
+            initialTimestamp: initialTimestamp,
+            mediaId: details.id,
+            mediaType: media.media_type,
+            seasonNum: isMovie ? null : pendingPlayRequest.season,
+            episodeNum: isMovie ? null : pendingPlayRequest.episode,
           },
         }),
       );
     } catch (err) {
       console.error("Error preparing stream:", err);
-      alert("Failed to prepare stream.");
+      showError("Failed to prepare stream. Please try again.");
     }
   }
 
@@ -598,6 +678,70 @@
     showTorrentSelector = false;
     pendingPlayRequest = null;
   }
+
+  const handleResearch = async (event) => {
+    console.log("=== RESEARCH EVENT RECEIVED ===");
+    console.log("Event detail:", event.detail);
+    console.log("isSearching:", isSearching);
+    console.log("pendingPlayRequest:", pendingPlayRequest);
+    
+    const { trackers } = event.detail;
+    
+    // Prevent concurrent searches
+    if (isSearching) {
+      console.log("Search already in progress, ignoring research request");
+      return;
+    }
+    
+    if (!pendingPlayRequest) {
+      console.log("No pending play request, ignoring research");
+      return;
+    }
+    
+    console.log("=== STARTING RESEARCH ===");
+    console.log("New trackers:", trackers);
+    
+    // Re-run the search with new tracker preference
+    isSearching = true;
+    searchResults = [];
+
+    const showName = details.title || details.name;
+    const isMovieCheck = media.media_type === "movie" || !!details.title;
+    const { season: seasonNum, episode: episodeNum } = pendingPlayRequest;
+
+    let searchQuery = showName;
+    if (isMovieCheck) {
+      const year = (details.release_date || "").split("-")[0];
+      if (year) {
+        searchQuery = `${showName} ${year}`;
+      }
+    }
+
+    const mediaType = isAnime() ? "anime" : (isMovieCheck ? "movie" : "tv");
+    
+    console.log("Invoking search_nyaa_filtered with:");
+    console.log("- query:", searchQuery);
+    console.log("- trackers:", trackers);
+    
+    try {
+      searchResults = await invoke("search_nyaa_filtered", {
+        query: searchQuery,
+        season: isMovieCheck ? null : seasonNum,
+        episode: isMovieCheck ? null : episodeNum,
+        isMovie: isMovieCheck,
+        mediaType: mediaType,
+        trackerPreference: trackers && trackers.length > 0 ? trackers : null,
+      });
+
+      console.log(`=== RESEARCH COMPLETE ===`);
+      console.log(`Found ${searchResults.length} results`);
+    } catch (err) {
+      console.error("Error during research:", err);
+      searchResults = [];
+    } finally {
+      isSearching = false;
+    }
+  };
 
   function showManualFileSelector(torrent, info, handleId) {
     // Filter to video files only
@@ -609,7 +753,7 @@
     });
     
     if (availableFiles.length === 0) {
-      alert("No video files found in this torrent.");
+      showError("No video files found in this torrent.");
       return;
     }
     
@@ -669,7 +813,7 @@
       closeFileSelector();
     } catch (err) {
       console.error("Error saving manual selection:", err);
-      alert("Failed to save selection.");
+      showError("Failed to save selection.");
     }
   }
 
@@ -731,9 +875,11 @@
               {/if}
 
               <div class="detail-meta">
+                {#if details.vote_average !== undefined && details.vote_average !== null}
                 <div class="rating-box {getRatingClass(details.vote_average)}">
                   {details.vote_average.toFixed(1)}
                 </div>
+                {/if}
                 {#if details.content_ratings?.results?.length || details.release_dates?.results?.length}
                   <span class="age-rating">
                     {#if details.content_ratings}
@@ -888,6 +1034,17 @@
                         {#if allSeasonsData[season.season_number]}
                           <div class="episodes-list">
                             {#each allSeasonsData[season.season_number].episodes as episode}
+                              {@const progressKey = `${details.id}-${media.media_type}`}
+                              {@const progress = $watchProgressStore[progressKey]}
+                              {@const hasProgress = progress && progress.currentSeason === season.season_number && progress.currentEpisode === episode.episode_number}
+                              {@const progressText = hasProgress ? (() => {
+                                const timestamp = progress.currentTimestamp || 0;
+                                const hours = Math.floor(timestamp / 3600);
+                                const minutes = Math.floor((timestamp % 3600) / 60);
+                                const seconds = Math.floor(timestamp % 60);
+                                if (hours > 0) return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                                return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+                              })() : ''}
                               <!-- svelte-ignore a11y-click-events-have-key-events -->
                               <!-- svelte-ignore a11y-no-static-element-interactions -->
                               <div
@@ -909,6 +1066,9 @@
                                     <div class="episode-placeholder">
                                       <i class="ri-film-line"></i>
                                     </div>
+                                  {/if}
+                                  {#if hasProgress}
+                                    <span class="progress-badge">{progressText}</span>
                                   {/if}
                                 </div>
                                 <div class="episode-details">
@@ -1234,6 +1394,13 @@
   </div>
 {/if}
 
+{#if showErrorModal}
+  <ErrorModal
+    {errorMessage}
+    title={errorTitle}
+    on:close={() => (showErrorModal = false)}
+  />
+{/if}
 {#if showTorrentSelector}
   <TorrentSelector
     searchQuery={currentSearchQuery}
@@ -1241,6 +1408,7 @@
     loading={isSearching}
     on:select={onTorrentSelect}
     on:close={closeTorrentSelector}
+    on:research={handleResearch}
   />
 {/if}
 

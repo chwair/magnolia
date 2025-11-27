@@ -20,9 +20,10 @@
   "dependencies": {
     "@fontsource-variable/geist-mono": "^5.2.7",
     "@fontsource/geist-sans": "^5.2.5",
-    "@tauri-apps/api": "^2.0.0",
-    "libass-wasm": "^4.1.0",
+    "@jellyfin/libass-wasm": "^4.2.3",
+    "@tauri-apps/api": "^2.9.0",
     "remixicon": "^4.7.0",
-    "web-demuxer": "^3.0.3"
+    "web-demuxer": "^3.0.3",
+    "wyzie-lib": "^2.2.5"
   }
 }

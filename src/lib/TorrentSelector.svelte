@@ -1,17 +1,38 @@
 <script>
-    import { createEventDispatcher } from "svelte";
+    import { createEventDispatcher, onDestroy } from "svelte";
     import { fade, scale } from "svelte/transition";
+    import { getTrackerPreference, setTrackerPreference } from "./stores/watchHistoryStore.js";
 
     export let results = [];
     export let searchQuery = "";
     export let loading = false;
 
     const dispatch = createEventDispatcher();
+    
+    let trackerMode = 'auto'; // 'auto' or 'manual'
+    let selectedTrackers = []; // For manual mode: ['nyaa', '1337x', etc]
+    
+    // Initialize from stored preference
+    const storedPref = getTrackerPreference();
+    if (Array.isArray(storedPref) && storedPref.length > 0) {
+        trackerMode = 'manual';
+        selectedTrackers = storedPref;
+    } else {
+        trackerMode = 'auto';
+    }
+    
+    onDestroy(() => {
+        if (researchTimeout) {
+            clearTimeout(researchTimeout);
+        }
+    });
 
     // Filter state
     let selectedBatch = "all"; // all, batch, single
     let selectedQuality = "all";
     let selectedEncode = "all";
+    let selectedAudioCodec = "all"; // all, no-ac3, specific codec
+    let hideIncompatible = true; // Hide incompatible audio codecs by default
     let sortBy = "relevance"; // relevance (backend order), seeds, size, name, peers
     let sortDirection = "desc"; // asc, desc
     let searchFilter = "";
@@ -19,6 +40,16 @@
     // Derived values
     $: availableQualities = [...new Set(results.map(r => r.quality).filter(Boolean))].sort();
     $: availableEncodes = [...new Set(results.map(r => r.encode).filter(Boolean))].sort();
+    $: availableAudioCodecs = [...new Set(results.map(r => r.audio_codec).filter(Boolean))].sort();
+
+    // Check if audio codec is web-compatible
+    // Supported: AAC, MP3, Opus, Vorbis, FLAC
+    // Unsupported: AC3, E-AC3, DTS, DTS-HD, TrueHD
+    function isWebCompatible(codec) {
+        if (!codec) return true; // Unknown assumed compatible
+        const compatible = ['AAC', 'MP3', 'Opus', 'Vorbis', 'FLAC'];
+        return compatible.includes(codec);
+    }
 
     // Filtered and sorted results
     $: filteredResults = results
@@ -37,6 +68,10 @@
 
             // Encode filter
             if (selectedEncode !== "all" && torrent.encode !== selectedEncode) return false;
+
+            // Audio codec filter - hide incompatible formats by default
+            if (hideIncompatible && !isWebCompatible(torrent.audio_codec)) return false;
+            if (selectedAudioCodec !== "all" && torrent.audio_codec !== selectedAudioCodec) return false;
 
             return true;
         })
@@ -77,6 +112,8 @@
         selectedBatch = "all";
         selectedQuality = "all";
         selectedEncode = "all";
+        selectedAudioCodec = "all";
+        hideIncompatible = true; // Keep incompatible formats hidden by default
         sortBy = "relevance";
         sortDirection = "desc";
         searchFilter = "";
@@ -90,6 +127,44 @@
             sortDirection = column === "name" ? "asc" : "desc";
         }
     }
+
+    let researchTimeout;
+    
+    function selectAuto() {
+        trackerMode = 'auto';
+        selectedTrackers = [];
+        triggerResearch();
+    }
+    
+    function toggleTracker(tracker) {
+        // Switching to manual mode by selecting a tracker
+        if (trackerMode === 'auto') {
+            trackerMode = 'manual';
+            selectedTrackers = [tracker];
+        } else {
+            const index = selectedTrackers.indexOf(tracker);
+            if (index > -1) {
+                selectedTrackers = selectedTrackers.filter(t => t !== tracker);
+                // If all deselected, switch back to auto
+                if (selectedTrackers.length === 0) {
+                    trackerMode = 'auto';
+                }
+            } else {
+                selectedTrackers = [...selectedTrackers, tracker];
+            }
+        }
+        triggerResearch();
+    }
+    
+    function triggerResearch() {
+        clearTimeout(researchTimeout);
+        researchTimeout = setTimeout(() => {
+            const trackerData = trackerMode === 'auto' ? [] : selectedTrackers;
+            console.log("Dispatching research event with trackers:", trackerData);
+            setTrackerPreference(trackerData);
+            dispatch("research", { trackers: trackerData });
+        }, 300);
+    }
 </script>
 
 <!-- svelte-ignore a11y-click-events-have-key-events -->
@@ -98,6 +173,46 @@
     <div class="modal-content" transition:scale on:click|stopPropagation>
         <div class="modal-header">
             <h3>Select a Torrent</h3>
+            <div class="tracker-selector">
+                <span class="tracker-label">Tracker:</span>
+                <div class="tracker-buttons">
+                    <button 
+                        class="tracker-btn" 
+                        class:active={trackerMode === 'auto'}
+                        on:click={selectAuto}
+                    >
+                        Auto
+                    </button>
+                    <button 
+                        class="tracker-btn" 
+                        class:active={selectedTrackers.includes('nyaa')}
+                        on:click={() => toggleTracker('nyaa')}
+                    >
+                        Nyaa
+                    </button>
+                    <button 
+                        class="tracker-btn" 
+                        class:active={selectedTrackers.includes('1337x')}
+                        on:click={() => toggleTracker('1337x')}
+                    >
+                        1337x
+                    </button>
+                    <button 
+                        class="tracker-btn" 
+                        class:active={selectedTrackers.includes('thepiratebay')}
+                        on:click={() => toggleTracker('thepiratebay')}
+                    >
+                        TPB
+                    </button>
+                    <button 
+                        class="tracker-btn" 
+                        class:active={selectedTrackers.includes('eztv')}
+                        on:click={() => toggleTracker('eztv')}
+                    >
+                        EZTV
+                    </button>
+                </div>
+            </div>
         </div>
 
         <div class="search-info">
@@ -198,6 +313,22 @@
                     </div>
                 {/if}
 
+                <!-- Audio Codec Filter - Hide Incompatible Toggle -->
+                <div class="filter-group">
+                    <span class="filter-label">Compatibility:</span>
+                    <div class="filter-options">
+                        <button 
+                            class="filter-chip" 
+                            class:active={hideIncompatible}
+                            on:click={() => hideIncompatible = !hideIncompatible}
+                            title="Hide torrents with incompatible audio codecs (AC3, DTS, TrueHD, etc.)"
+                        >
+                            <i class="ri-{hideIncompatible ? 'eye-off' : 'eye'}-line"></i>
+                            Hide Incompatible
+                        </button>
+                    </div>
+                </div>
+
                 <button class="reset-btn" on:click={resetFilters}>
                     <i class="ri-refresh-line"></i>
                 </button>
@@ -208,7 +339,8 @@
             {#if loading}
                 <div class="loading-state">
                     <div class="spinner"></div>
-                    <p>Searching torrents...</p>
+                    <p>Searching {trackerMode === 'auto' ? 'multiple trackers' : `${selectedTrackers.length} tracker(s)`} for "{searchQuery}"...</p>
+                    <span class="loading-subtext">This may take a few seconds</span>
                 </div>
             {:else if results.length === 0}
                 <div class="empty-state">
@@ -345,6 +477,48 @@
         font-weight: 600;
         color: var(--text-primary);
         letter-spacing: -0.01em;
+    }
+
+    .tracker-selector {
+        display: flex;
+        align-items: center;
+        gap: var(--spacing-md);
+    }
+
+    .tracker-label {
+        font-size: 13px;
+        color: var(--text-secondary);
+        font-weight: 500;
+    }
+
+    .tracker-buttons {
+        display: flex;
+        gap: var(--spacing-xs);
+    }
+
+    .tracker-btn {
+        padding: 6px 14px;
+        background: var(--bg-tertiary);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        color: var(--text-secondary);
+        border-radius: var(--border-radius-sm);
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        font-family: inherit;
+    }
+
+    .tracker-btn:hover {
+        background: rgba(255, 255, 255, 0.08);
+        border-color: rgba(255, 255, 255, 0.15);
+        color: var(--text-primary);
+    }
+
+    .tracker-btn.active {
+        background: var(--accent-color);
+        border-color: var(--accent-color);
+        color: white;
     }
 
     .search-info {
@@ -762,6 +936,18 @@
         color: var(--text-secondary);
         gap: var(--spacing-lg);
         min-height: 300px;
+    }
+
+    .loading-state p {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 500;
+    }
+
+    .loading-subtext {
+        font-size: 12px;
+        color: var(--text-tertiary);
+        margin-top: -8px;
     }
 
     .spinner {

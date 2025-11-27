@@ -1,4 +1,4 @@
-use super::{SearchProvider, SearchResult};
+use super::{SearchProvider, SearchResult, parse_audio_codec};
 use async_trait::async_trait;
 use reqwest::Client;
 use scraper::{Html, Selector};
@@ -144,6 +144,7 @@ impl SearchProvider for PirateBayProvider {
                                 };
 
                                 let (season, episode, quality, encode, is_batch) = self.parse_metadata(&name);
+                                let audio_codec = parse_audio_codec(&name);
 
                                 results.push(SearchResult {
                                     title: name,
@@ -157,6 +158,7 @@ impl SearchProvider for PirateBayProvider {
                                     quality,
                                     encode,
                                     is_batch,
+                                    audio_codec,
                                 });
                             }
                         }

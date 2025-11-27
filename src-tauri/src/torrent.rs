@@ -17,6 +17,7 @@ use axum::{
 };
 use tower_http::cors::CorsLayer;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::Mutex;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TorrentFile {
@@ -91,8 +92,9 @@ pub struct StreamStatus {
 }
 
 #[derive(Clone)]
-struct AppState {
-    session: Arc<Session>,
+pub struct AppState {
+    pub session: Arc<Session>,
+    pub hls_cache: Arc<Mutex<HashMap<String, PathBuf>>>,
 }
 
 struct TorrentEntry {
@@ -106,6 +108,245 @@ pub struct TorrentManager {
     torrents: Arc<RwLock<HashMap<usize, TorrentEntry>>>,
     next_id: Arc<RwLock<usize>>,
     http_addr: SocketAddr,
+}
+
+async fn get_file_metadata(
+    Path((session_id, file_id)): Path<(usize, usize)>,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    tracing::info!("Metadata request: session_id={}, file_id={}", session_id, file_id);
+    
+    let handle = match state.session.get(TorrentIdOrHash::Id(session_id)) {
+        Some(h) => {
+            tracing::info!("Found torrent handle for session_id={}", session_id);
+            h
+        },
+        None => {
+            tracing::error!("Torrent not found for session_id={}", session_id);
+            return (StatusCode::NOT_FOUND, "Torrent not found").into_response();
+        },
+    };
+
+    if handle.with_metadata(|meta| meta.file_infos.get(file_id).is_none()).unwrap_or(true) {
+        tracing::error!("File not found: file_id={}", file_id);
+        return (StatusCode::NOT_FOUND, "File not found").into_response();
+    }
+    
+    tracing::info!("Creating stream for file_id={}", file_id);
+    
+    // Check file size first
+    let file_size = match handle.with_metadata(|meta| {
+        meta.file_infos.get(file_id).map(|f| f.len)
+    }) {
+        Ok(Some(size)) => size,
+        _ => {
+            tracing::error!("Could not get file size");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Could not get file size").into_response();
+        }
+    };
+    
+    tracing::info!("File size: {} bytes", file_size);
+    
+    // For metadata extraction, we need enough data downloaded
+    // Check if we have at least 100MB or the full file if smaller
+    let min_required = std::cmp::min(file_size, 100 * 1024 * 1024);
+    
+    let mut stream = match handle.stream(file_id) {
+        Ok(s) => {
+            tracing::info!("Stream created successfully");
+            s
+        },
+        Err(e) => {
+            tracing::error!("Failed to create stream for file_id {}: {}", file_id, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to stream: {}", e)).into_response();
+        }
+    };
+
+    let temp_dir = std::env::temp_dir();
+    let temp_file_path = temp_dir.join(format!("magnolia_metadata_{}_{}.mkv", session_id, file_id));
+    
+    tracing::info!("Creating temp file at: {:?}", temp_file_path);
+    let mut temp_file = match tokio::fs::File::create(&temp_file_path).await {
+        Ok(f) => {
+            tracing::info!("Temp file created successfully");
+            f
+        },
+        Err(e) => {
+            tracing::error!("Failed to create temp file: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create temp file: {}", e)).into_response();
+        }
+    };
+
+    // Read up to 100MB for metadata extraction (needs more data for complete MKV headers)
+    tracing::info!("Starting to read stream data (need at least {} bytes)...", min_required);
+    let mut total_read = 0usize;
+    let chunk_size = 1024 * 1024; // 1MB chunks
+    let max_size = std::cmp::min(file_size as usize, 100 * 1024 * 1024); // Up to 100MB
+    let mut buffer = vec![0u8; chunk_size];
+    
+    let mut consecutive_empty_reads = 0;
+    let max_empty_reads = 50; // Allow up to 50 empty reads (with delays) before giving up
+    
+    while total_read < max_size {
+        let bytes_read = match stream.read(&mut buffer).await {
+            Ok(0) => {
+                consecutive_empty_reads += 1;
+                if consecutive_empty_reads >= max_empty_reads {
+                    tracing::warn!("Too many empty reads, stopping at {} bytes", total_read);
+                    break;
+                }
+                tracing::debug!("No data available yet, waiting... (attempt {}/{})", consecutive_empty_reads, max_empty_reads);
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                continue;
+            },
+            Ok(n) => {
+                consecutive_empty_reads = 0; // Reset counter on successful read
+                tracing::debug!("Read {} bytes (total: {})", n, total_read + n);
+                n
+            },
+            Err(e) => {
+                tracing::error!("Failed to read stream at byte {}: {}", total_read, e);
+                let _ = tokio::fs::remove_file(&temp_file_path).await;
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read stream: {}", e)).into_response();
+            }
+        };
+        
+        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut temp_file, &buffer[..bytes_read]).await {
+            tracing::error!("Failed to write temp file at byte {}: {}", total_read, e);
+            let _ = tokio::fs::remove_file(&temp_file_path).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write temp file: {}", e)).into_response();
+        }
+        
+        total_read += bytes_read;
+    }
+    
+    tracing::info!("Finished reading {} bytes ({}% of target), syncing file...", 
+        total_read, (total_read * 100) / max_size);
+    
+    // Check if we have enough data
+    if total_read < 10 * 1024 * 1024 {
+        tracing::error!("Not enough data read for metadata extraction: {} bytes (need at least 10MB)", total_read);
+        let _ = tokio::fs::remove_file(&temp_file_path).await;
+        return (StatusCode::SERVICE_UNAVAILABLE, "Not enough data available yet, please wait for torrent to buffer more data").into_response();
+    }
+    
+    // Flush and sync the file before reading with ffprobe
+    if let Err(e) = temp_file.sync_all().await {
+        tracing::error!("Failed to sync temp file: {}", e);
+        let _ = tokio::fs::remove_file(&temp_file_path).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to sync temp file: {}", e)).into_response();
+    }
+    drop(temp_file); // Close the file handle
+    
+    tracing::info!("File synced successfully, extracting metadata with ffprobe...");
+
+    let metadata = match extract_mkv_metadata_ffprobe(&temp_file_path).await {
+        Ok(m) => {
+            tracing::info!("Metadata extracted successfully: {} audio, {} subtitle, {} chapters", 
+                m.audio_tracks.len(), m.subtitle_tracks.len(), m.chapters.len());
+            m
+        },
+        Err(e) => {
+            tracing::error!("Failed to extract metadata: {}", e);
+            let _ = tokio::fs::remove_file(&temp_file_path).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to extract metadata: {}", e)).into_response();
+        }
+    };
+
+    tracing::info!("Cleaning up temp file...");
+    let _ = tokio::fs::remove_file(&temp_file_path).await;
+    
+    tracing::info!("Returning metadata response");
+    axum::Json(metadata).into_response()
+}
+
+async fn get_subtitle_track(
+    Path((session_id, file_id, track_index)): Path<(usize, usize, usize)>,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    use tokio::process::Command;
+    
+    tracing::info!("Subtitle request: session={}, file={}, track={}", session_id, file_id, track_index);
+    
+    let handle = match state.session.get(TorrentIdOrHash::Id(session_id)) {
+        Some(h) => h,
+        None => return (StatusCode::NOT_FOUND, "Torrent not found").into_response(),
+    };
+
+    let mut stream = match handle.stream(file_id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to create stream: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to stream: {}", e)).into_response();
+        }
+    };
+
+    // Read enough data for subtitle extraction
+    let temp_dir = std::env::temp_dir();
+    let temp_file_path = temp_dir.join(format!("magnolia_sub_{}_{}.mkv", session_id, file_id));
+    
+    let mut temp_file = match tokio::fs::File::create(&temp_file_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("Failed to create temp file: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create temp file").into_response();
+        }
+    };
+
+    // Read up to 500MB to ensure we get all subtitle data
+    let mut total_read = 0usize;
+    let chunk_size = 1024 * 1024;
+    let max_size = 500 * 1024 * 1024;
+    let mut buffer = vec![0u8; chunk_size];
+    
+    while total_read < max_size {
+        match stream.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if tokio::io::AsyncWriteExt::write_all(&mut temp_file, &buffer[..n]).await.is_err() {
+                    let _ = tokio::fs::remove_file(&temp_file_path).await;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to write temp file").into_response();
+                }
+                total_read += n;
+            }
+            Err(_) => break,
+        }
+    }
+    
+    temp_file.sync_all().await.ok();
+    drop(temp_file);
+
+    // Extract subtitle using ffmpeg
+    let output = match Command::new("ffmpeg")
+        .args(&[
+            "-i", temp_file_path.to_str().unwrap(),
+            "-map", &format!("0:s:{}", track_index),
+            "-f", "ass",
+            "-"
+        ])
+        .output()
+        .await {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::error!("Failed to run ffmpeg: {}", e);
+                let _ = tokio::fs::remove_file(&temp_file_path).await;
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to extract subtitle").into_response();
+            }
+        };
+
+    let _ = tokio::fs::remove_file(&temp_file_path).await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("ffmpeg subtitle extraction failed: {}", stderr);
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Subtitle extraction failed").into_response();
+    }
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/x-ssa")
+        .body(Body::from(output.stdout))
+        .unwrap()
 }
 
 async fn stream_file(
@@ -203,10 +444,19 @@ impl TorrentManager {
 
         let state = AppState {
             session: session.clone(),
+            hls_cache: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let app = Router::new()
             .route("/torrents/{session_id}/stream/{file_id}", get(stream_file))
+            .route("/torrents/{session_id}/metadata/{file_id}", get(get_file_metadata))
+            .route("/torrents/{session_id}/subtitles/{file_id}/{track_index}", get(get_subtitle_track))
+            .route("/torrents/{session_id}/dash/{file_id}/manifest.mpd", get(crate::dash::dash_manifest))
+            .route("/torrents/{session_id}/dash/{file_id}/video/init.mp4", get(crate::dash::dash_video_init))
+            .route("/torrents/{session_id}/dash/{file_id}/video/segment/{segment_num}", get(crate::dash::dash_video_segment))
+            .route("/torrents/{session_id}/dash/{file_id}/audio/{track_id}/init.mp4", get(crate::dash::dash_audio_init))
+            .route("/torrents/{session_id}/dash/{file_id}/audio/{track_id}/segment/{segment_num}", get(crate::dash::dash_audio_segment))
+            .route("/torrents/{session_id}/dash/{file_id}/subtitles/{track_id}/subtitle.ass", get(crate::dash::dash_subtitle))
             .layer(CorsLayer::permissive())
             .with_state(state);
 
@@ -531,7 +781,7 @@ impl TorrentManager {
                 // Check if file is already fully downloaded
                 if stats.progress_bytes >= stats.total_bytes && stats.total_bytes > 0 {
                     let file_path = self.download_dir.join(&file_name_path);
-                    extract_mkv_metadata(&file_path).await.ok()
+                    extract_mkv_metadata_ffprobe(&file_path).await.ok()
                 } else {
                     None
                 }
@@ -640,52 +890,133 @@ impl TorrentManager {
     }
 }
 
-async fn extract_mkv_metadata(file_path: &std::path::Path) -> Result<MkvMetadata> {
-    use std::fs::File;
-    use std::io::BufReader;
+async fn extract_mkv_metadata_ffprobe(file_path: &std::path::Path) -> Result<MkvMetadata> {
+    use tokio::process::Command;
     
-    tracing::info!("Opening MKV file: {:?}", file_path);
+    tracing::info!("Extracting metadata with ffprobe: {:?}", file_path);
     
-    let file = File::open(file_path)
-        .context("Failed to open MKV file")?;
-    let reader = BufReader::new(file);
+    // Check if file exists
+    if !file_path.exists() {
+        tracing::error!("File does not exist: {:?}", file_path);
+        return Err(anyhow::anyhow!("File does not exist"));
+    }
     
-    let mkv = matroska::Matroska::open(reader)
-        .context("Failed to parse MKV file")?;
+    let file_size = std::fs::metadata(file_path)?.len();
+    tracing::info!("File size: {} bytes", file_size);
     
-    tracing::info!("Successfully parsed MKV file");
+    let output = Command::new("ffprobe")
+        .args(&[
+            "-v", "error",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            "-show_chapters",
+            file_path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .context("Failed to run ffprobe command")?;
+    
+    tracing::info!("ffprobe exit status: {}", output.status);
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        tracing::error!("ffprobe failed with status: {}", output.status);
+        tracing::error!("ffprobe stderr: {}", stderr);
+        tracing::error!("ffprobe stdout: {}", stdout);
+        return Err(anyhow::anyhow!("ffprobe failed: {}", stderr));
+    }
+    
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    tracing::debug!("ffprobe output: {}", stdout_str);
+    
+    let probe_data: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("Failed to parse ffprobe JSON output")?;
     
     let mut audio_tracks = Vec::new();
     let mut subtitle_tracks = Vec::new();
+    let mut chapters = Vec::new();
     
-    for track in mkv.tracks {
-        match track.tracktype {
-            matroska::Tracktype::Audio => {
-                audio_tracks.push(AudioTrack {
-                    index: audio_tracks.len(),
-                    language: track.language.as_ref().map(|l| format!("{:?}", l)),
-                    codec: Some(track.codec_id.clone()),
-                    name: track.name.clone(),
-                });
-            },
-            matroska::Tracktype::Subtitle => {
-                subtitle_tracks.push(SubtitleTrack {
-                    index: subtitle_tracks.len(),
-                    language: track.language.as_ref().map(|l| format!("{:?}", l)),
-                    codec: Some(track.codec_id.clone()),
-                    name: track.name.clone(),
-                });
-            },
-            _ => {}
+    // Extract streams
+    if let Some(streams) = probe_data.get("streams").and_then(|s| s.as_array()) {
+        let mut audio_index = 0;
+        let mut subtitle_index = 0;
+        
+        for stream in streams {
+            let codec_type = stream.get("codec_type").and_then(|t| t.as_str());
+            
+            match codec_type {
+                Some("audio") => {
+                    let codec_name = stream.get("codec_name").and_then(|c| c.as_str()).unwrap_or("unknown");
+                    let language = stream.get("tags")
+                        .and_then(|t| t.get("language"))
+                        .and_then(|l| l.as_str())
+                        .unwrap_or("und")
+                        .to_string();
+                    let title = stream.get("tags")
+                        .and_then(|t| t.get("title"))
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string());
+                    
+                    audio_tracks.push(AudioTrack {
+                        index: audio_index,
+                        language: Some(language),
+                        codec: Some(codec_name.to_string()),
+                        name: title,
+                    });
+                    audio_index += 1;
+                }
+                Some("subtitle") => {
+                    let codec_name = stream.get("codec_name").and_then(|c| c.as_str()).unwrap_or("unknown");
+                    let language = stream.get("tags")
+                        .and_then(|t| t.get("language"))
+                        .and_then(|l| l.as_str())
+                        .unwrap_or("und")
+                        .to_string();
+                    let title = stream.get("tags")
+                        .and_then(|t| t.get("title"))
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string());
+                    
+                    subtitle_tracks.push(SubtitleTrack {
+                        index: subtitle_index,
+                        language: Some(language),
+                        codec: Some(codec_name.to_string()),
+                        name: title,
+                    });
+                    subtitle_index += 1;
+                }
+                _ => {}
+            }
         }
     }
     
-    let chapters = Vec::new();
-    // Note: matroska crate doesn't expose chapters directly in a simple way
-    // We'll leave this empty for now - the video player can still use browser controls
+    // Extract chapters
+    if let Some(chapters_data) = probe_data.get("chapters").and_then(|c| c.as_array()) {
+        for (index, chapter) in chapters_data.iter().enumerate() {
+            let start_str = chapter.get("start_time").and_then(|s| s.as_str());
+            let end_str = chapter.get("end_time").and_then(|e| e.as_str());
+            let title = chapter.get("tags")
+                .and_then(|t| t.get("title"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string());
+            
+            if let (Some(start), Some(end)) = (start_str, end_str) {
+                if let (Ok(start_time), Ok(end_time)) = (start.parse::<f64>(), end.parse::<f64>()) {
+                    chapters.push(Chapter {
+                        index,
+                        title,
+                        start_time,
+                        end_time,
+                    });
+                }
+            }
+        }
+    }
     
-    tracing::info!("Extracted {} audio tracks, {} subtitle tracks", 
-        audio_tracks.len(), subtitle_tracks.len());
+    tracing::info!("Extracted {} audio tracks, {} subtitle tracks, {} chapters", 
+        audio_tracks.len(), subtitle_tracks.len(), chapters.len());
     
     Ok(MkvMetadata {
         audio_tracks,

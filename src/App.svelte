@@ -9,6 +9,7 @@
   import VideoPlayer from "./lib/VideoPlayer.svelte";
   import { myListStore } from "./lib/stores/listStore.js";
   import { watchHistoryStore } from "./lib/stores/watchHistoryStore.js";
+  import { watchProgressStore } from "./lib/stores/watchProgressStore.js";
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   let searchActive = false;
@@ -27,6 +28,7 @@
 
   $: myList = $myListStore;
   $: watchHistory = $watchHistoryStore;
+  $: watchProgress = $watchProgressStore;
 
   onMount(() => {
     window.addEventListener("openMediaDetail", (e) => {
@@ -134,19 +136,26 @@
         savedScrollPosition = scrollContainer.scrollTop;
       }
     }
+    
     if (selectedMedia?.id !== media.id) {
       historyIndex++;
-      mediaHistory = [...mediaHistory.slice(0, historyIndex), media];
-      // Add to watch history
-      watchHistoryStore.addItem(media);
+      // Store clean version in history without autoPlay/resumeProgress
+      const cleanMedia = { ...media };
+      delete cleanMedia.autoPlay;
+      delete cleanMedia.resumeProgress;
+      mediaHistory = [...mediaHistory.slice(0, historyIndex), cleanMedia];
     }
+    // Set selectedMedia with all flags intact for initial processing
     selectedMedia = media;
   }
 
   function navigateBack() {
     if (historyIndex > 0) {
       historyIndex--;
-      selectedMedia = mediaHistory[historyIndex];
+      const media = { ...mediaHistory[historyIndex] };
+      delete media.autoPlay;
+      delete media.resumeProgress;
+      selectedMedia = media;
     } else if (historyIndex === 0) {
       historyIndex = -1;
       selectedMedia = null;
@@ -163,7 +172,10 @@
   function navigateForward() {
     if (historyIndex < mediaHistory.length - 1) {
       historyIndex++;
-      selectedMedia = mediaHistory[historyIndex];
+      const media = { ...mediaHistory[historyIndex] };
+      delete media.autoPlay;
+      delete media.resumeProgress;
+      selectedMedia = media;
     }
   }
 
@@ -232,7 +244,14 @@
               customItems={watchHistory}
               accentColor="#10b981"
               showClearButton={true}
+              hideViewAll={true}
+              isRecentlyWatched={true}
+              {watchProgress}
               on:clear={() => watchHistoryStore.clear()}
+              on:removeItem={(e) => {
+                watchHistoryStore.removeItem(e.detail.id, e.detail.media_type);
+                watchProgressStore.removeProgress(e.detail.id, e.detail.media_type);
+              }}
             />
           {/if}
 
@@ -331,4 +350,5 @@
   .dashboard {
     padding: 0 var(--spacing-xl) 40px;
   }
+  
 </style>

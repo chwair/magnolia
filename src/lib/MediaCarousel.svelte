@@ -13,6 +13,9 @@ export let genre = null;
 export let accentColor = '#6366f1';
 export let customItems = null;
 export let showClearButton = false;
+export let hideViewAll = false;
+export let isRecentlyWatched = false;
+export let watchProgress = {};
 
 let items = [];
 let loading = true;
@@ -29,6 +32,11 @@ $: {
 $: {
   if (myListItems && items.length > 0) {
     console.log(`🔄 ${title}: myListItems updated, size:`, myListItems.size);
+  }
+}
+$: {
+  if (isRecentlyWatched && watchProgress) {
+    console.log('📊 watchProgress updated in carousel:', Object.keys(watchProgress).length, 'entries');
   }
 }
 
@@ -218,7 +226,65 @@ function toggleMyList(event, item) {
   }
   console.log('🔘 Toggle button clicked for:', item.title || item.name);
   myListStore.toggleItem(item);
-}function handleViewAll() {
+}
+
+function handleQuickPlay(event, item) {
+  event.stopPropagation();
+  
+  // Get saved progress
+  const key = `${item.id}-${item.media_type}`;
+  const progress = watchProgress[key];
+  
+  // Open detail and trigger autoplay with resume progress
+  window.dispatchEvent(new CustomEvent('openMediaDetail', { 
+    detail: { ...item, autoPlay: true, resumeProgress: progress } 
+  }));
+}
+
+function handleRemoveFromHistory(event, item) {
+  event.stopPropagation();
+  dispatch('removeItem', { id: item.id, media_type: item.media_type });
+}
+
+function getProgressInfo(item) {
+  // For recently watched, progress info is stored directly on the item
+  // (added by watchHistoryStore.addItem)
+  const progress = item.currentSeason ? item : (watchProgress[`${item.id}-${item.media_type}`] || null);
+  
+  if (!progress) return null;
+  
+  // For TV shows, show episode
+  if ((item.media_type === 'tv' || item.first_air_date) && progress.currentSeason && progress.currentEpisode) {
+    const s = progress.currentSeason.toString().padStart(2, '0');
+    const e = progress.currentEpisode.toString().padStart(2, '0');
+    
+    // If there's also a timestamp, show it too
+    if (progress.currentTimestamp && progress.currentTimestamp > 60) {
+      const minutes = Math.floor(progress.currentTimestamp / 60);
+      const seconds = progress.currentTimestamp % 60;
+      return `S${s}E${e} · ${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
+    
+    return `S${s}E${e}`;
+  }
+  
+  // For movies, show timestamp
+  if (progress.currentTimestamp && progress.currentTimestamp > 60) {
+    const totalMinutes = Math.floor(progress.currentTimestamp / 60);
+    const seconds = progress.currentTimestamp % 60;
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    
+    if (hours > 0) {
+      return `${hours}h ${minutes}m`;
+    }
+    return `${totalMinutes}:${seconds.toString().padStart(2, '0')}`;
+  }
+  
+  return null;
+}
+
+function handleViewAll() {
   const detail = {
     title,
     type,
@@ -240,7 +306,9 @@ function toggleMyList(event, item) {
       Clear
     </button>
   {/if}
-  <button class="btn-standard view-all" on:click={handleViewAll}>View All →</button>
+  {#if !hideViewAll}
+    <button class="btn-standard view-all" on:click={handleViewAll}>View All →</button>
+  {/if}
 </div>
 </div>
 {#if loading}
@@ -253,16 +321,22 @@ function toggleMyList(event, item) {
         <i class="ri-arrow-left-s-line"></i>
       </button>
       <div class="carousel" bind:this={carouselElement} on:scroll={updateArrows}>
-{#each items as item (item.id)}
+{#each items as item, index (`${item.id}-${item.media_type}-${index}`)}
 <!-- svelte-ignore a11y-click-events-have-key-events -->
 <!-- svelte-ignore a11y-no-static-element-interactions -->
 <div class="media-card" style="--card-accent: {cardColors[item.id] || accentColor}" on:click={() => openDetail(item)}>
 {#if item.poster_path}
 <img class="media-poster" src={getImageUrl(item.poster_path, 'w500')} alt={item.title || item.name} loading="lazy" />
+{#if isRecentlyWatched}
+  {@const progressInfo = getProgressInfo(item)}
+  {#if progressInfo}
+    <div class="progress-badge">{progressInfo}</div>
+  {/if}
+{/if}
 {/if}
 <div class="media-content">
 <div class="media-info">
-<h3 class="media-title">{item.title || item.name}</h3>
+<h3 class="media-title">{item.title || item.name || 'Unknown'}</h3>
 <div class="media-meta">
 <span>{formatDate(item.release_date || item.first_air_date)}</span>
 <span class="rating-badge {getRatingClass(item.vote_average)}">
@@ -271,9 +345,18 @@ function toggleMyList(event, item) {
 </div>
 </div>
 <div class="media-actions">
-<button class="action-btn" title="Play" on:click={(e) => e.stopPropagation()}>
+<button class="action-btn" title="Play" on:click={(e) => handleQuickPlay(e, item)}>
 <i class="ri-play-fill"></i>
 </button>
+{#if isRecentlyWatched}
+<button 
+  class="action-btn" 
+  title="Remove from Recently Watched"
+  on:click={(e) => handleRemoveFromHistory(e, item)}
+>
+<i class="ri-close-line"></i>
+</button>
+{:else}
 <button 
   class="action-btn" 
   title={myListItems.has(`${item.id}-${item.media_type}`) ? "Remove from List" : "Add to List"}
@@ -281,6 +364,7 @@ function toggleMyList(event, item) {
 >
 <i class="{myListItems.has(`${item.id}-${item.media_type}`) ? 'ri-check-line' : 'ri-add-line'}"></i>
 </button>
+{/if}
 </div>
 </div>
 </div>

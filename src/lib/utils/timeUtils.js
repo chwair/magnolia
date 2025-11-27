@@ -1,6 +1,6 @@
 export function formatTime(seconds) {
   if (!seconds && seconds !== 0) return '0:00';
-  if (isNaN(seconds)) return '0:00';
+  if (!isFinite(seconds)) return '0:00';
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   const s = Math.floor(seconds % 60);

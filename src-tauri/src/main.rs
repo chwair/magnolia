@@ -5,12 +5,16 @@
 mod search;
 mod torrent;
 mod tracking;
+mod dash;
+mod media_cache;
 
-use search::{nyaa::NyaaProvider, x1337::X1337Provider, piratebay::PirateBayProvider, SearchProvider};
+use search::{nyaa::NyaaProvider, x1337::X1337Provider, piratebay::PirateBayProvider, 
+             SearchProvider};
 use std::sync::Arc;
 use tauri::{Manager, State};
 use torrent::TorrentManager;
 use tracking::TrackingManager;
+use media_cache::{MediaCache, TrackType};
 
 #[tauri::command]
 async fn search_nyaa(query: String) -> Result<Vec<search::SearchResult>, String> {
@@ -18,28 +22,14 @@ async fn search_nyaa(query: String) -> Result<Vec<search::SearchResult>, String>
     provider.search(&query).await.map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-async fn search_nyaa_filtered(
-    query: String,
-    season: Option<u32>,
-    episode: Option<u32>,
-    is_movie: bool,
-    media_type: Option<String>, // "anime", "tv", "movie"
-) -> Result<Vec<search::SearchResult>, String> {
-    // Normalize query
-    let normalized_query = query
-        .replace("-", " ")
-        .replace(":", " ")
-        .replace("_", " ");
-    
-    // Choose provider based on media type
-    let mut results = if let Some(ref mt) = media_type {
+async fn search_by_media_type(query: &str, media_type: &Option<String>) -> Result<Vec<search::SearchResult>, String> {
+    if let Some(ref mt) = media_type {
         println!("Media type: {}", mt);
         if mt == "anime" {
             // Use Nyaa for anime
             println!("Using Nyaa provider for anime");
             let provider = NyaaProvider::new();
-            provider.search(&normalized_query).await.map_err(|e| e.to_string())?
+            provider.search(query).await.map_err(|e| e.to_string())
         } else {
             // Use 1337x and PirateBay for all non-anime content (movies and TV)
             println!("Using 1337x and ThePirateBay for non-anime");
@@ -48,7 +38,7 @@ async fn search_nyaa_filtered(
             // Try 1337x
             println!("Searching 1337x...");
             let x1337 = X1337Provider::new();
-            match x1337.search(&normalized_query).await {
+            match x1337.search(query).await {
                 Ok(mut results) => {
                     println!("1337x returned {} results", results.len());
                     all_results.append(&mut results);
@@ -61,7 +51,7 @@ async fn search_nyaa_filtered(
             // Add PirateBay results
             println!("Searching ThePirateBay...");
             let tpb = PirateBayProvider::new();
-            match tpb.search(&normalized_query).await {
+            match tpb.search(query).await {
                 Ok(mut results) => {
                     println!("ThePirateBay returned {} results", results.len());
                     all_results.append(&mut results);
@@ -71,74 +61,175 @@ async fn search_nyaa_filtered(
                 }
             }
             
-            all_results
+            Ok(all_results)
         }
     } else {
         // Default to Nyaa if no media type specified
         let provider = NyaaProvider::new();
-        provider.search(&normalized_query).await.map_err(|e| e.to_string())?
-    };
+        provider.search(query).await.map_err(|e| e.to_string())
+    }
+}
 
+#[tauri::command]
+async fn search_nyaa_filtered(
+    query: String,
+    season: Option<u32>,
+    episode: Option<u32>,
+    is_movie: bool,
+    media_type: Option<String>, // "anime", "tv", "movie"
+    tracker_preference: Option<Vec<String>>, // ["nyaa", "1337x", ...] or None for auto
+) -> Result<Vec<search::SearchResult>, String> {
+    println!("search_nyaa_filtered called with tracker_preference: {:?}", tracker_preference);
+    
+    // Normalize query
+    let normalized_query = query
+        .replace("-", " ")
+        .replace(":", " ")
+        .replace("_", " ");
+    
+    // Determine which trackers to use
+    let trackers: Vec<String> = if let Some(prefs) = tracker_preference {
+        if prefs.is_empty() {
+            // Empty array means auto mode
+            match media_type.as_deref() {
+                Some("anime") => vec!["nyaa".to_string()],
+                _ => vec!["1337x".to_string(), "thepiratebay".to_string()],
+            }
+        } else {
+            // Use specified trackers
+            prefs
+        }
+    } else {
+        // null/undefined means auto mode
+        match media_type.as_deref() {
+            Some("anime") => vec!["nyaa".to_string()],
+            _ => vec!["1337x".to_string(), "thepiratebay".to_string()],
+        }
+    };
+    
+    println!("Using trackers: {:?}", trackers);
+    
+    // Search all trackers in parallel
+    let mut handles = vec![];
+    
+    for tracker in trackers {
+        // Skip EZTV as it requires IMDb ID (use search_eztv_by_imdb instead)
+        if tracker == "eztv" {
+            println!("Skipping EZTV in regular search (requires IMDb ID)");
+            continue;
+        }
+        
+        let query_clone = normalized_query.clone();
+        let handle = tokio::spawn(async move {
+            let result: Result<Vec<search::SearchResult>, Box<dyn std::error::Error + Send + Sync>> = match tracker.as_str() {
+                "nyaa" => {
+                    println!("Searching Nyaa...");
+                    NyaaProvider::new().search(&query_clone).await
+                }
+                "1337x" => {
+                    println!("Searching 1337x...");
+                    X1337Provider::new().search(&query_clone).await
+                }
+                "thepiratebay" => {
+                    println!("Searching ThePirateBay...");
+                    PirateBayProvider::new().search(&query_clone).await
+                }
+                _ => {
+                    println!("Unknown tracker: {}", tracker);
+                    Ok(vec![])
+                }
+            };
+            
+            match result {
+                Ok(results) => {
+                    println!("{} returned {} results", tracker, results.len());
+                    results
+                }
+                Err(e) => {
+                    println!("{} error: {}", tracker, e);
+                    vec![]
+                }
+            }
+        });
+        handles.push(handle);
+    }
+    
+    // Wait for all searches to complete
+    let mut all_results = Vec::new();
+    for handle in handles {
+        if let Ok(results) = handle.await {
+            all_results.extend(results);
+        }
+    }
+    
+    println!("Total results before deduplication: {}", all_results.len());
+    
+    // Deduplicate by info hash (from magnet link)
+    let mut seen_hashes = std::collections::HashSet::new();
+    all_results.retain(|result| {
+        if let Some(hash) = extract_info_hash(&result.magnet_link) {
+            seen_hashes.insert(hash)
+        } else {
+            true // Keep if can't extract hash
+        }
+    });
+    
+    println!("Total results after deduplication: {}", all_results.len());
+    
     // Filter results based on media type and requested episode/season
-    results.retain(|result| {
+    all_results.retain(|result| {
         if is_movie {
-            // For movies, keep everything
             true
         } else {
-            // For TV shows, more lenient filtering
             match (season, episode) {
                 (Some(req_season), Some(req_episode)) => {
-                    // Check if torrent has season/episode info
                     if let Some(s) = result.season {
-                        // Has season info
                         if s != req_season {
-                            return false; // Wrong season
+                            return false;
                         }
-                        
-                        // Right season - now check episode
                         if result.is_batch {
-                            return true; // Batch for correct season
+                            return true;
                         }
-                        
                         if let Some(e) = result.episode {
-                            return e == req_episode; // Exact episode match
+                            return e == req_episode;
                         }
-                        
-                        // Has season but no episode and not batch - might be single episode torrent
-                        // that failed to parse, keep it
                         return true;
                     } else {
-                        // No season/episode metadata detected
-                        // Keep it as it might be a valid single episode torrent that wasn't parsed
                         true
                     }
                 }
                 (Some(req_season), None) => {
-                    // Just season requested
                     if let Some(s) = result.season {
                         s == req_season
                     } else {
-                        true // Keep torrents without metadata
+                        true
                     }
                 }
-                _ => true, // Keep everything if no filtering criteria
+                _ => true,
             }
         }
     });
 
-    // Sort by relevance score (descending), then by seeds
-    results.sort_by(|a, b| {
+    // Sort by relevance score
+    all_results.sort_by(|a, b| {
         let score_a = calculate_relevance_score(a, season, episode, &normalized_query);
         let score_b = calculate_relevance_score(b, season, episode, &normalized_query);
-        
-        // First sort by relevance score
         match score_b.cmp(&score_a) {
-            std::cmp::Ordering::Equal => b.seeds.cmp(&a.seeds), // If equal score, sort by seeds
+            std::cmp::Ordering::Equal => b.seeds.cmp(&a.seeds),
             other => other,
         }
     });
 
-    Ok(results)
+    Ok(all_results)
+}
+
+// Extract info hash from magnet link for deduplication
+fn extract_info_hash(magnet: &str) -> Option<String> {
+    magnet
+        .split('&')
+        .find(|part| part.starts_with("xt=urn:btih:"))
+        .and_then(|part| part.strip_prefix("xt=urn:btih:"))
+        .map(|hash| hash.to_lowercase())
 }
 
 fn calculate_relevance_score(
@@ -219,6 +310,13 @@ fn calculate_relevance_score(
 }
 
 #[tauri::command]
+async fn search_eztv_by_imdb(imdb_id: String) -> Result<Vec<search::SearchResult>, String> {
+    println!("Searching EZTV with IMDb ID: {}", imdb_id);
+    let provider = search::eztv::EZTVProvider::new();
+    provider.search_by_imdb(&imdb_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn save_torrent_selection(
     tracking: State<'_, TrackingManager>,
     show_id: u32,
@@ -232,15 +330,71 @@ async fn save_torrent_selection(
         .await;
     Ok(())
 }
-
 #[tauri::command]
 async fn get_saved_selection(
     tracking: State<'_, TrackingManager>,
-    show_id: u32,
+    #[allow(non_snake_case)] showId: u32,
     season: u32,
     episode: u32,
 ) -> Result<Option<tracking::EpisodeTorrent>, String> {
-    Ok(tracking.get_selection(show_id, season, episode).await)
+    Ok(tracking.get_selection(showId, season, episode).await)
+}
+
+#[tauri::command]
+async fn save_subtitle_cache(
+    cache: State<'_, MediaCache>,
+    cache_id: String,
+    file_index: usize,
+    track_index: usize,
+    data: String,
+) -> Result<(), String> {
+    cache.save_track(TrackType::Subtitle, &cache_id, file_index, track_index, data.into_bytes()).await
+}
+
+#[tauri::command]
+async fn load_subtitle_cache(
+    cache: State<'_, MediaCache>,
+    cache_id: String,
+    file_index: usize,
+    track_index: usize,
+) -> Result<Option<String>, String> {
+    let result = cache.load_track(TrackType::Subtitle, &cache_id, file_index, track_index).await?;
+    Ok(result.and_then(|bytes| String::from_utf8(bytes).ok()))
+}
+
+#[tauri::command]
+async fn clear_subtitle_cache(
+    cache: State<'_, MediaCache>,
+) -> Result<(), String> {
+    cache.clear_cache(TrackType::Subtitle).await
+}
+
+#[tauri::command]
+async fn save_audio_cache(
+    cache: State<'_, MediaCache>,
+    cache_id: String,
+    file_index: usize,
+    track_index: usize,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    cache.save_track(TrackType::Audio, &cache_id, file_index, track_index, data).await
+}
+
+#[tauri::command]
+async fn load_audio_cache(
+    cache: State<'_, MediaCache>,
+    cache_id: String,
+    file_index: usize,
+    track_index: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    cache.load_track(TrackType::Audio, &cache_id, file_index, track_index).await
+}
+
+#[tauri::command]
+async fn clear_audio_cache(
+    cache: State<'_, MediaCache>,
+) -> Result<(), String> {
+    cache.clear_cache(TrackType::Audio).await
 }
 
 fn main() {
@@ -260,6 +414,9 @@ fn main() {
 
             let tracking_manager = TrackingManager::new(app_data_dir.clone());
             app.manage(tracking_manager);
+
+            let media_cache = MediaCache::new(app_data_dir.clone());
+            app.manage(media_cache);
 
             let torrent_dir = app_data_dir.join("torrents");
             let torrent_manager = tauri::async_runtime::block_on(async {
@@ -298,8 +455,15 @@ fn main() {
             torrent::get_download_dir,
             search_nyaa,
             search_nyaa_filtered,
+            search_eztv_by_imdb,
             save_torrent_selection,
-            get_saved_selection
+            get_saved_selection,
+            save_subtitle_cache,
+            load_subtitle_cache,
+            clear_subtitle_cache,
+            save_audio_cache,
+            load_audio_cache,
+            clear_audio_cache
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

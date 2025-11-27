@@ -1,4 +1,4 @@
-use super::{SearchProvider, SearchResult};
+use super::{SearchProvider, SearchResult, parse_audio_codec};
 use async_trait::async_trait;
 use reqwest::Client;
 use scraper::{Html, Selector};
@@ -121,6 +121,7 @@ impl NyaaProvider {
 
     fn parse_torrent_metadata(&self, data: &[u8]) -> Option<(Option<u32>, Option<u32>, Option<String>, Option<String>, bool)> {
         #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
         struct FileEntry {
             path: Vec<String>,
             length: Option<i64>,
@@ -266,6 +267,7 @@ impl SearchProvider for NyaaProvider {
             };
 
             let (season, episode, quality, encode, is_batch) = self.parse_metadata(&title, &magnet_link);
+            let audio_codec = parse_audio_codec(&title);
 
             // Debug logging
             if season.is_some() || episode.is_some() {
@@ -285,6 +287,7 @@ impl SearchProvider for NyaaProvider {
                 quality,
                 encode,
                 is_batch,
+                audio_codec,
             });
             }
         }

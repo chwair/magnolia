@@ -202,3 +202,27 @@ export async function getSimilarTV(tvId, page = 1) {
   );
   return response.json();
 }
+
+export async function getMovieExternalIds(movieId) {
+  const response = await fetch(
+    `${TMDB_BASE_URL}/movie/${movieId}/external_ids`,
+    { headers }
+  );
+  return response.json();
+}
+
+export async function getTVExternalIds(tvId) {
+  const response = await fetch(
+    `${TMDB_BASE_URL}/tv/${tvId}/external_ids`,
+    { headers }
+  );
+  return response.json();
+}
+
+export async function getEpisodeExternalIds(tvId, seasonNumber, episodeNumber) {
+  const response = await fetch(
+    `${TMDB_BASE_URL}/tv/${tvId}/season/${seasonNumber}/episode/${episodeNumber}/external_ids`,
+    { headers }
+  );
+  return response.json();
+}
