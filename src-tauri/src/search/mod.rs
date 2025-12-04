@@ -1,5 +1,5 @@
 pub mod nyaa;
-pub mod x1337;
+pub mod limetorrents;
 pub mod piratebay;
 pub mod eztv;
 
@@ -59,6 +59,7 @@ pub fn parse_audio_codec(title: &str) -> Option<String> {
 
 // Check if audio codec is supported by web browsers
 // Based on: https://developer.mozilla.org/en-US/docs/Web/Media/Guides/Formats/Audio_codecs
+#[allow(dead_code)]
 pub fn is_web_compatible(codec: Option<&str>) -> bool {
     match codec {
         // Supported web audio codecs

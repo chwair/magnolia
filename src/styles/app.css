@@ -1,0 +1,42 @@
+main {
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--bg-color);
+  color: var(--text-color);
+}
+
+.titlebar-wrapper {
+  position: relative;
+  transition: opacity 0.3s ease, transform 0.3s ease;
+  z-index: 10001;
+}
+
+.titlebar-wrapper.hidden {
+  opacity: 0;
+  transform: translateY(-100%);
+}
+
+.titlebar-wrapper.hidden :global(*:not(.window-controls):not(.window-controls *)) {
+  pointer-events: none;
+}
+
+.content-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  position: relative;
+  transition: filter 0.3s ease;
+}
+
+.content-scroll.blur {
+  filter: blur(8px);
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.dashboard {
+  padding: 0 var(--spacing-xl) 40px;
+}

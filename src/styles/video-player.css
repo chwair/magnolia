@@ -292,7 +292,6 @@
     font-size: 14px;
     font-weight: 500;
     font-variant-numeric: tabular-nums;
-    text-shadow: 0 2px 4px rgba(0, 0, 0, 0.8);
     white-space: nowrap;
     min-width: 90px;
     display: flex;
@@ -474,6 +473,11 @@
     margin-left: auto;
 }
 
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
 .player-track-info {
     display: flex;
     align-items: center;
@@ -551,7 +555,6 @@
 .indicator-value {
     font-size: 18px;
     font-weight: 600;
-    text-shadow: 0 2px 8px rgba(0, 0, 0, 0.9);
     background: rgba(0, 0, 0, 0.7);
     padding: 4px 12px;
     border-radius: var(--border-radius-sm);
@@ -605,12 +608,12 @@
     left: 0;
     width: 100%;
     height: 100%;
-    background: rgba(0, 0, 0, 0.85);
+    background: color-mix(in srgb, var(--bg-primary) 92%, transparent);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 50;
-    backdrop-filter: blur(20px);
+    backdrop-filter: blur(30px);
 }
 
 .loading-content {
@@ -618,25 +621,99 @@
     flex-direction: column;
     align-items: center;
     gap: var(--spacing-lg);
-    padding: var(--spacing-2xl);
-    background: rgba(0, 0, 0, 0.6);
-    backdrop-filter: blur(10px);
-    border-radius: var(--border-radius-md);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    min-width: 300px;
+    padding: var(--spacing-2xl) var(--spacing-3xl);
+    background: color-mix(in srgb, var(--bg-primary) 95%, transparent);
+    backdrop-filter: blur(20px);
+    border-radius: var(--border-radius-lg);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    min-width: 420px;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6);
 }
 
-.spinner {
-    width: 48px;
-    height: 48px;
-    border: 4px solid rgba(255, 255, 255, 0.1);
-    border-top-color: var(--accent-color);
+/* Phase indicator - new design */
+.loading-phases {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    margin-bottom: var(--spacing-lg);
+}
+
+.loading-phase {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    opacity: 0.35;
+    transition: all 0.3s ease;
+}
+
+.loading-phase.active,
+.loading-phase.complete {
+    opacity: 1;
+}
+
+.phase-icon {
+    width: 32px;
+    height: 32px;
     border-radius: 50%;
-    animation: spin 1s linear infinite;
+    background: rgba(255, 255, 255, 0.06);
+    border: 2px solid rgba(255, 255, 255, 0.12);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    transition: all 0.3s ease;
 }
 
-@keyframes spin {
-    to { transform: rotate(360deg); }
+.loading-phase.active .phase-icon {
+    background: color-mix(in srgb, var(--accent-color) 15%, transparent);
+    border-color: var(--accent-color);
+    color: var(--accent-color);
+    box-shadow: 0 0 20px color-mix(in srgb, var(--accent-color) 30%, transparent);
+}
+
+.loading-phase.complete .phase-icon {
+    background: var(--accent-color);
+    border-color: var(--accent-color);
+    color: #000;
+}
+
+.loading-phase.complete .phase-icon i {
+    font-size: 16px;
+    font-weight: 700;
+}
+
+.phase-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    transition: color 0.3s ease;
+}
+
+.loading-phase.active .phase-label {
+    color: var(--text-primary);
+}
+
+.loading-phase.complete .phase-label {
+    color: var(--text-secondary);
+}
+
+.phase-connector {
+    width: 32px;
+    height: 2px;
+    background: rgba(255, 255, 255, 0.08);
+    margin: 0 6px;
+    margin-bottom: 26px;
+    border-radius: 1px;
+    transition: background 0.3s ease;
+}
+
+.phase-connector.complete {
+    background: var(--accent-color);
 }
 
 .loading-status {
@@ -644,6 +721,7 @@
     font-size: 14px;
     font-weight: 500;
     text-align: center;
+    min-height: 20px;
 }
 
 .loading-progress {
@@ -659,6 +737,7 @@
     background: rgba(255, 255, 255, 0.1);
     border-radius: 3px;
     overflow: hidden;
+    position: relative;
 }
 
 .progress-fill {
@@ -666,12 +745,38 @@
     background: var(--accent-color);
     transition: width 0.3s ease;
     border-radius: 3px;
+    min-width: 0;
+}
+
+/* Indeterminate progress bar animation */
+.progress-bar-loading.indeterminate {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.progress-fill-indeterminate {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: 40%;
+    background: linear-gradient(90deg, transparent, var(--accent-color), transparent);
+    border-radius: 3px;
+    animation: indeterminate 1.5s ease-in-out infinite;
+}
+
+@keyframes indeterminate {
+    0% {
+        left: -40%;
+    }
+    100% {
+        left: 100%;
+    }
 }
 
 .loading-stats {
     display: flex;
-    justify-content: space-between;
-    gap: var(--spacing-md);
+    justify-content: center;
+    gap: var(--spacing-lg);
     font-family: "Geist Mono Variable", monospace;
     font-size: 12px;
     color: var(--text-secondary);
@@ -679,6 +784,52 @@
 
 .loading-stats span {
     white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+}
+
+.loading-stats .speed-stat {
+    color: var(--accent-color);
+}
+
+.loading-stats.peer-stats {
+    margin-top: calc(-1 * var(--spacing-xs));
+}
+
+.loading-stats .peer-stat {
+    color: var(--text-tertiary);
+}
+
+.loading-stats .peer-stat i {
+    font-size: 13px;
+    opacity: 0.7;
+}
+
+.cancel-loading-btn {
+    margin-top: var(--spacing-sm);
+    padding: var(--spacing-sm) var(--spacing-lg);
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: var(--border-radius-sm);
+    color: var(--text-secondary);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-xs);
+}
+
+.cancel-loading-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: var(--text-primary);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.cancel-loading-btn i {
+    font-size: 16px;
 }
 
 .peer-count {

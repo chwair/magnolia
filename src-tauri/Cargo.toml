@@ -11,10 +11,13 @@ edition = "2021"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+ffmpeg-sidecar = "2.3.0"
 
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -34,7 +37,10 @@ serde_bencode = "0.2"
 regex = "1.10"
 tempfile = "3"
 chrono = "0.4"
+urlencoding = "2.1"
 sha2 = "0.10"
+base64 = "0.22"
+ffmpeg-sidecar = "2.3.0"
 
 
 [features]

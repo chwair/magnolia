@@ -9,12 +9,15 @@
     getMovieRecommendations,
     getTVRecommendations,
     getImageUrl,
+    getTVExternalIds,
+    getMovieExternalIds,
   } from "./tmdb.js";
   import { myListStore } from "./stores/listStore.js";
   import { watchProgressStore } from "./stores/watchProgressStore.js";
   import { getTrackerPreference, setTrackerPreference } from "./stores/watchHistoryStore.js";
   import { invoke } from "@tauri-apps/api/core";
   import TorrentSelector from "./TorrentSelector.svelte";
+  import FileSelector from "./FileSelector.svelte";
   import ErrorModal from "./ErrorModal.svelte";
 
   import { createEventDispatcher } from "svelte";
@@ -43,12 +46,15 @@
   let searchResults = [];
   let isSearching = false;
   let currentSearchQuery = "";
+  let originalSearchQuery = ""; // The original auto-generated query for revert
   let pendingPlayRequest = null; // { season, episode }
+  let currentImdbId = null; // IMDB ID for EZTV search
   
   // Manual file selection state
   let showFileSelector = false;
   let availableFiles = [];
   let selectedTorrentForManual = null;
+  let selectedTorrentName = ""; // For display in TorrentSelector
   let manualHandleId = null;
   let autoPlayTriggered = false;
 
@@ -78,6 +84,16 @@
     return details.genres.some(genre => genre.id === 16);
   };
 
+  // Helper function to extract torrent name from magnet link
+  function extractTorrentNameFromMagnet(magnetLink) {
+    if (!magnetLink) return "";
+    const dnMatch = magnetLink.match(/dn=([^&]+)/);
+    if (dnMatch) {
+      return decodeURIComponent(dnMatch[1].replace(/\+/g, ' '));
+    }
+    return "";
+  }
+
   $: {
     if (media && isInMyList !== undefined) {
       console.log(
@@ -97,6 +113,7 @@
     selectedEpisode = null;
     recommendations = [];
     autoPlayTriggered = false; // Reset autoplay flag for new media
+    selectedTorrentName = ""; // Reset torrent name for new media
   }
 
   $: if (details) {
@@ -384,12 +401,49 @@
   }
 
   import { getRatingClass } from "./utils/colorUtils.js";
+  import { formatTime } from "./utils/timeUtils.js";
 
   function showError(message, title = "Error") {
     errorMessage = message;
     errorTitle = title;
     showErrorModal = true;
   }
+
+  // Get resume info for the play button
+  function getResumeInfo() {
+    if (!details) return null;
+    const progress = watchProgressStore.getProgress(details.id, media.media_type);
+    if (!progress) return null;
+    
+    const isMovie = media.media_type === 'movie' || !!details.title;
+    
+    if (isMovie) {
+      // For movies, show timestamp if we have progress
+      if (progress.currentTimestamp && progress.currentTimestamp > 60) {
+        return {
+          label: `Resume from ${formatTime(progress.currentTimestamp)}`,
+          season: null,
+          episode: null,
+          timestamp: progress.currentTimestamp
+        };
+      }
+    } else {
+      // For TV shows, show last episode watched
+      if (progress.currentSeason && progress.currentEpisode) {
+        const hasTimestamp = progress.currentTimestamp && progress.currentTimestamp > 60;
+        return {
+          label: `S${progress.currentSeason}E${progress.currentEpisode}${hasTimestamp ? ` • ${formatTime(progress.currentTimestamp)}` : ''}`,
+          season: progress.currentSeason,
+          episode: progress.currentEpisode,
+          timestamp: progress.currentTimestamp || 0
+        };
+      }
+    }
+    return null;
+  }
+
+  // Reactive variable for resume info
+  $: resumeInfo = details ? getResumeInfo() : null;
 
   function toggleSeason(seasonNumber) {
     if (selectedSeason === seasonNumber) {
@@ -457,6 +511,23 @@
     showTorrentSelector = true;
     searchResults = [];
 
+    // Try to get the saved torrent name for display
+    if (!selectedTorrentName) {
+      try {
+        // Check if there's any saved selection for this show to get the torrent name
+        const anySaved = await invoke("get_saved_selection", {
+          showId: details.id,
+          season: seasonNum,
+          episode: episodeNum,
+        });
+        if (anySaved?.magnet_link) {
+          selectedTorrentName = extractTorrentNameFromMagnet(anySaved.magnet_link);
+        }
+      } catch (err) {
+        // Ignore - just won't show a previous torrent name
+      }
+    }
+
     const showName = details.title || details.name;
     const isMovie = media.media_type === "movie" || !!details.title;
 
@@ -467,11 +538,11 @@
       if (year) {
         searchQuery = `${showName} ${year}`;
       }
-      currentSearchQuery = `${showName} (Movie)`;
+      currentSearchQuery = searchQuery;
+      originalSearchQuery = searchQuery;
     } else {
-      const s = seasonNum.toString().padStart(2, "0");
-      const e = episodeNum.toString().padStart(2, "0");
-      currentSearchQuery = `${showName} S${s}E${e}`;
+      currentSearchQuery = showName;
+      originalSearchQuery = showName;
     }
 
     console.log("Starting search:", searchQuery);
@@ -485,6 +556,32 @@
     const trackerArray = Array.isArray(storedTrackers) && storedTrackers.length > 0 ? storedTrackers : null;
     console.log("Tracker preference:", trackerArray);
 
+    // Fetch IMDB ID for EZTV support (TV shows only)
+    let imdbId = null;
+    if (!isMovie && (!trackerArray || trackerArray.includes('eztv'))) {
+      try {
+        const externalIds = await getTVExternalIds(details.id);
+        if (externalIds?.imdb_id) {
+          imdbId = externalIds.imdb_id;
+          currentImdbId = imdbId;
+          console.log("Got IMDB ID:", imdbId);
+        }
+      } catch (err) {
+        console.warn("Failed to get IMDB ID:", err);
+      }
+    } else if (isMovie) {
+      try {
+        const externalIds = await getMovieExternalIds(details.id);
+        if (externalIds?.imdb_id) {
+          imdbId = externalIds.imdb_id;
+          currentImdbId = imdbId;
+          console.log("Got Movie IMDB ID:", imdbId);
+        }
+      } catch (err) {
+        console.warn("Failed to get Movie IMDB ID:", err);
+      }
+    }
+
     // Execute search with filtering on backend
     try {
       searchResults = await invoke("search_nyaa_filtered", {
@@ -494,6 +591,7 @@
         isMovie: isMovie,
         mediaType: mediaType,
         trackerPreference: trackerArray,
+        imdbId: imdbId,
       });
 
       if (searchResults.length === 0) {
@@ -525,6 +623,9 @@
   async function onTorrentSelect(event) {
     const torrent = event.detail;
     console.log("Selected torrent:", torrent);
+    
+    // Store the selected torrent name for display
+    selectedTorrentName = torrent.title || "";
 
     if (!pendingPlayRequest) return;
 
@@ -541,29 +642,36 @@
       const info = await invoke("get_torrent_info", { handleId });
 
       console.log("Torrent info:", info);
+      
+      // Filter to video files only
+      const videoFiles = info.files.filter(f => {
+        const ext = f.name.toLowerCase();
+        return ext.endsWith('.mkv') || ext.endsWith('.mp4') || 
+               ext.endsWith('.avi') || ext.endsWith('.mov') || 
+               ext.endsWith('.webm') || ext.endsWith('.m4v');
+      });
 
-      // 2. Find the matching file
-      // Simple heuristic: look for SXXEXX or just EXX in filename
+      // 2. Find the matching file for the requested episode
       const s = pendingPlayRequest.season.toString().padStart(2, "0");
       const e = pendingPlayRequest.episode.toString().padStart(2, "0");
 
       let fileIndex = -1;
 
       // Try specific match first
-      fileIndex = info.files.findIndex(
+      fileIndex = videoFiles.findIndex(
         (f) =>
           f.name.toUpperCase().includes(`S${s}E${e}`) ||
           f.name.toUpperCase().includes(`${pendingPlayRequest.season}X${e}`),
       );
 
-      // If not found, and it's a single file torrent, use it
-      if (fileIndex === -1 && info.files.length === 1) {
+      // If not found, and it's a single video file torrent, use it
+      if (fileIndex === -1 && videoFiles.length === 1) {
         fileIndex = 0;
       }
 
       // If still not found, maybe try just episode number if it's a season pack?
       if (fileIndex === -1) {
-        fileIndex = info.files.findIndex(
+        fileIndex = videoFiles.findIndex(
           (f) =>
             f.name.toUpperCase().includes(`E${e}`) ||
             f.name.toUpperCase().includes(` ${e} `),
@@ -572,40 +680,75 @@
 
       if (fileIndex !== -1) {
         console.log("Found matching file at index:", fileIndex);
+        const matchedFile = videoFiles[fileIndex];
 
-        // 3. Save selection
+        // 3. Save selection for the requested episode
         await invoke("save_torrent_selection", {
           showId: details.id,
           season: pendingPlayRequest.season,
           episode: pendingPlayRequest.episode,
           magnetLink: torrent.magnet_link,
-          fileIndex: info.files[fileIndex].index,
+          fileIndex: matchedFile.index,
         });
 
-        // If this is a batch torrent, save it for all episodes in the batch
-        if (torrent.is_batch && info.files.length > 1) {
-          console.log("Batch torrent detected, saving for all episodes");
-          for (const file of info.files) {
-            // Extract episode number from filename
-            const epMatch = file.name.match(/[Ee](?:pisode)?\s*(\d+)|[-\s](\d{1,3})\s*(?:v\d)?/);
-            if (epMatch) {
-              const episodeNum = parseInt(epMatch[1] || epMatch[2]);
-              if (episodeNum && episodeNum !== pendingPlayRequest.episode) {
-                console.log(`Saving batch entry for episode ${episodeNum}`);
-                await invoke("save_torrent_selection", {
-                  showId: details.id,
-                  season: pendingPlayRequest.season,
-                  episode: episodeNum,
-                  magnetLink: torrent.magnet_link,
-                  fileIndex: file.index,
-                });
+        // 4. Auto-assign ALL other video files that have episode numbers
+        if (videoFiles.length > 1) {
+          console.log("Multi-episode torrent detected, auto-assigning all episodes");
+          for (const file of videoFiles) {
+            if (file.index === matchedFile.index) continue; // Skip the one we already saved
+            
+            // Try multiple patterns to extract episode info
+            const filename = file.name;
+            let season = pendingPlayRequest.season; // Default to current season
+            let episode = null;
+            
+            // Pattern: S01E05, S1E5
+            const sxeMatch = filename.match(/S(\d{1,2})E(\d{1,3})/i);
+            if (sxeMatch) {
+              season = parseInt(sxeMatch[1]);
+              episode = parseInt(sxeMatch[2]);
+            }
+            
+            // Pattern: 1x05, 01x05
+            if (!episode) {
+              const xMatch = filename.match(/(\d{1,2})x(\d{2,3})/i);
+              if (xMatch) {
+                season = parseInt(xMatch[1]);
+                episode = parseInt(xMatch[2]);
               }
+            }
+            
+            // Pattern: Episode 5, Ep 05, E05 (without season)
+            if (!episode) {
+              const epMatch = filename.match(/(?:Episode|Ep\.?|E)[\s._-]*(\d{1,3})/i);
+              if (epMatch) {
+                episode = parseInt(epMatch[1]);
+              }
+            }
+            
+            // Pattern: - 05 - or [ 05 ] or common anime patterns like "- 05 "
+            if (!episode) {
+              const dashMatch = filename.match(/[-\[\s](\d{2,3})[-\]\s]/);
+              if (dashMatch) {
+                episode = parseInt(dashMatch[1]);
+              }
+            }
+            
+            if (episode && episode > 0) {
+              console.log(`Auto-assigning S${season}E${episode} to file: ${filename}`);
+              await invoke("save_torrent_selection", {
+                showId: details.id,
+                season: season,
+                episode: episode,
+                magnetLink: torrent.magnet_link,
+                fileIndex: file.index,
+              });
             }
           }
         }
 
-        // 4. Start Stream
-        startStream(torrent.magnet_link, info.files[fileIndex].index, handleId);
+        // 5. Start Stream
+        startStream(torrent.magnet_link, matchedFile.index, handleId);
         showTorrentSelector = false;
       } else {
         // Show manual file selection
@@ -685,7 +828,7 @@
     console.log("isSearching:", isSearching);
     console.log("pendingPlayRequest:", pendingPlayRequest);
     
-    const { trackers } = event.detail;
+    const { trackers, query: customQuery, useImdb } = event.detail;
     
     // Prevent concurrent searches
     if (isSearching) {
@@ -700,6 +843,8 @@
     
     console.log("=== STARTING RESEARCH ===");
     console.log("New trackers:", trackers);
+    console.log("Custom query:", customQuery);
+    console.log("Use IMDB:", useImdb);
     
     // Re-run the search with new tracker preference
     isSearching = true;
@@ -709,19 +854,49 @@
     const isMovieCheck = media.media_type === "movie" || !!details.title;
     const { season: seasonNum, episode: episodeNum } = pendingPlayRequest;
 
-    let searchQuery = showName;
-    if (isMovieCheck) {
-      const year = (details.release_date || "").split("-")[0];
-      if (year) {
-        searchQuery = `${showName} ${year}`;
+    // Use custom query if provided, otherwise build default
+    let searchQuery = customQuery;
+    if (!searchQuery) {
+      searchQuery = showName;
+      if (isMovieCheck) {
+        const year = (details.release_date || "").split("-")[0];
+        if (year) {
+          searchQuery = `${showName} ${year}`;
+        }
       }
     }
+    
+    // Update the currentSearchQuery for display
+    currentSearchQuery = searchQuery;
 
     const mediaType = isAnime() ? "anime" : (isMovieCheck ? "movie" : "tv");
+    
+    // If useImdb is true, re-fetch IMDB ID for EZTV
+    let imdbIdToUse = currentImdbId;
+    if (useImdb && !imdbIdToUse) {
+      try {
+        if (!isMovieCheck) {
+          const externalIds = await getTVExternalIds(details.id);
+          if (externalIds?.imdb_id) {
+            imdbIdToUse = externalIds.imdb_id;
+            currentImdbId = imdbIdToUse;
+          }
+        } else {
+          const externalIds = await getMovieExternalIds(details.id);
+          if (externalIds?.imdb_id) {
+            imdbIdToUse = externalIds.imdb_id;
+            currentImdbId = imdbIdToUse;
+          }
+        }
+      } catch (err) {
+        console.warn("Failed to re-fetch IMDB ID:", err);
+      }
+    }
     
     console.log("Invoking search_nyaa_filtered with:");
     console.log("- query:", searchQuery);
     console.log("- trackers:", trackers);
+    console.log("- imdbId:", imdbIdToUse);
     
     try {
       searchResults = await invoke("search_nyaa_filtered", {
@@ -731,6 +906,7 @@
         isMovie: isMovieCheck,
         mediaType: mediaType,
         trackerPreference: trackers && trackers.length > 0 ? trackers : null,
+        imdbId: imdbIdToUse,
       });
 
       console.log(`=== RESEARCH COMPLETE ===`);
@@ -763,57 +939,44 @@
     showTorrentSelector = false;
   }
 
-  async function selectManualFile(file) {
-    try {
-      // Save the selection
-      await invoke("save_torrent_selection", {
-        showId: details.id,
-        season: pendingPlayRequest.season,
-        episode: pendingPlayRequest.episode,
-        magnetLink: selectedTorrentForManual.magnet_link,
-        fileIndex: file.index,
-      });
+  async function handleFileSelectorConfirm(event) {
+    const assignments = event.detail;
+    
+    if (!assignments || assignments.length === 0) {
+      closeFileSelector();
+      return;
+    }
 
-      // Try to infer numbering from selected file for batch torrents
-      if (selectedTorrentForManual.is_batch && availableFiles.length > 1) {
-        console.log("Inferring episode numbering from manual selection");
-        
-        // Extract episode number from selected filename
-        const selectedEpMatch = file.name.match(/[Ee](?:pisode)?\s*(\d+)|[-\s](\d{1,3})\s*(?:v\d)?/);
-        if (selectedEpMatch) {
-          const selectedEpNum = parseInt(selectedEpMatch[1] || selectedEpMatch[2]);
-          const offset = pendingPlayRequest.episode - selectedEpNum;
-          
-          console.log(`Selected file is E${selectedEpNum}, current episode is E${pendingPlayRequest.episode}, offset: ${offset}`);
-          
-          // Apply offset to other files
-          for (const otherFile of availableFiles) {
-            if (otherFile.index === file.index) continue;
-            
-            const epMatch = otherFile.name.match(/[Ee](?:pisode)?\s*(\d+)|[-\s](\d{1,3})\s*(?:v\d)?/);
-            if (epMatch) {
-              const fileEpNum = parseInt(epMatch[1] || epMatch[2]);
-              const inferredEpisode = fileEpNum + offset;
-              
-              console.log(`Saving E${inferredEpisode} for file: ${otherFile.name}`);
-              await invoke("save_torrent_selection", {
-                showId: details.id,
-                season: pendingPlayRequest.season,
-                episode: inferredEpisode,
-                magnetLink: selectedTorrentForManual.magnet_link,
-                fileIndex: otherFile.index,
-              });
-            }
-          }
-        }
+    try {
+      // Save all assignments
+      for (const { file, season, episode } of assignments) {
+        console.log(`Saving S${season}E${episode} for file: ${file.name}`);
+        await invoke("save_torrent_selection", {
+          showId: details.id,
+          season: season,
+          episode: episode,
+          magnetLink: selectedTorrentForManual.magnet_link,
+          fileIndex: file.index,
+        });
       }
 
-      // Start stream
-      startStream(selectedTorrentForManual.magnet_link, file.index, manualHandleId);
+      // Find the assignment that matches the pending play request, or use first one
+      let playAssignment = assignments.find(
+        a => a.season === pendingPlayRequest.season && a.episode === pendingPlayRequest.episode
+      );
+      
+      if (!playAssignment) {
+        playAssignment = assignments[0];
+        // Update pending request to match what we're actually playing
+        pendingPlayRequest = { season: playAssignment.season, episode: playAssignment.episode };
+      }
+
+      // Start stream with the selected file
+      startStream(selectedTorrentForManual.magnet_link, playAssignment.file.index, manualHandleId);
       closeFileSelector();
     } catch (err) {
-      console.error("Error saving manual selection:", err);
-      showError("Failed to save selection.");
+      console.error("Error saving file selections:", err);
+      showError("Failed to save selections.");
     }
   }
 
@@ -927,20 +1090,28 @@
 
               <div class="detail-actions">
                 <button
-                  class="btn-standard primary btn-large"
+                  class="btn-standard primary btn-large play-btn-with-resume"
                   on:click={() => {
                     if (details.seasons && details.seasons.length > 0) {
-                      // Default to S1E1
-                      handlePlay(1, 1);
+                      // Use resume info if available, otherwise default to S1E1
+                      if (resumeInfo && resumeInfo.season && resumeInfo.episode) {
+                        handlePlay(resumeInfo.season, resumeInfo.episode);
+                      } else {
+                        handlePlay(1, 1);
+                      }
                     } else {
                       // Movie
-                      handlePlay(0, 0); // Use 0,0 for movie? Or handle differently.
-                      // Actually for movie we should pass something else or handle in handlePlay
+                      handlePlay(0, 0);
                     }
                   }}
                 >
                   <i class="ri-play-fill"></i>
-                  Play
+                  <div class="play-btn-content">
+                    <span class="play-btn-main">{resumeInfo ? 'Resume' : 'Play'}</span>
+                    {#if resumeInfo}
+                      <span class="play-btn-resume-info">{resumeInfo.label}</span>
+                    {/if}
+                  </div>
                 </button>
                 <button class="btn-standard btn-large" on:click={toggleMyList}>
                   <i class={isInMyList ? "ri-check-line" : "ri-add-line"}></i>
@@ -1396,7 +1567,7 @@
 
 {#if showErrorModal}
   <ErrorModal
-    {errorMessage}
+    message={errorMessage}
     title={errorTitle}
     on:close={() => (showErrorModal = false)}
   />
@@ -1404,8 +1575,12 @@
 {#if showTorrentSelector}
   <TorrentSelector
     searchQuery={currentSearchQuery}
+    originalSearchQuery={originalSearchQuery}
     results={searchResults}
     loading={isSearching}
+    selectedTorrentName={selectedTorrentName}
+    isAnime={isAnime()}
+    hasImdbId={!!currentImdbId}
     on:select={onTorrentSelect}
     on:close={closeTorrentSelector}
     on:research={handleResearch}
@@ -1413,34 +1588,11 @@
 {/if}
 
 {#if showFileSelector}
-  <!-- svelte-ignore a11y-click-events-have-key-events -->
-  <!-- svelte-ignore a11y-no-static-element-interactions -->
-  <div class="modal-overlay" on:click={closeFileSelector}>
-    <!-- svelte-ignore a11y-click-events-have-key-events -->
-    <!-- svelte-ignore a11y-no-static-element-interactions -->
-    <div class="file-selector-modal" on:click={(e) => e.stopPropagation()}>
-      <div class="file-selector-header">
-        <h3>Select Episode File</h3>
-        <button class="btn-standard" on:click={closeFileSelector}>
-          <i class="ri-close-line"></i>
-        </button>
-      </div>
-      <div class="file-selector-content">
-        <p class="file-selector-hint">
-          Could not automatically detect the episode file. Please select it manually:
-        </p>
-        <div class="file-list">
-          {#each availableFiles as file}
-            <!-- svelte-ignore a11y-click-events-have-key-events -->
-            <!-- svelte-ignore a11y-no-static-element-interactions -->
-            <div class="file-item" on:click={() => selectManualFile(file)}>
-              <i class="ri-file-text-line"></i>
-              <span class="file-name">{file.name}</span>
-              <span class="file-size">{((file.length || file.size || 0) / 1024 / 1024).toFixed(1)} MB</span>
-            </div>
-          {/each}
-        </div>
-      </div>
-    </div>
-  </div>
+  <FileSelector
+    files={availableFiles}
+    showName={details.title || details.name}
+    seasons={details.seasons?.filter(s => s.season_number > 0) || []}
+    on:confirm={handleFileSelectorConfirm}
+    on:close={closeFileSelector}
+  />
 {/if}

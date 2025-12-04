@@ -18,6 +18,20 @@ use axum::{
 use tower_http::cors::CorsLayer;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
+use ffmpeg_sidecar::paths::ffmpeg_path;
+
+// Unsupported audio codecs that need transcoding for web playback
+// These codecs are typically not supported by web browsers natively
+const UNSUPPORTED_AUDIO_CODECS: &[&str] = &[
+    // Lossless/HD formats
+    "truehd", "mlp", "pcm", "dsd",
+    // DTS variants
+    "dts", "dca", "dts-hd", "dtshd", "dts_hd", "dtse",
+    // Dolby variants  
+    "ac3", "eac3", "ac-3", "e-ac-3", "dolby", "atmos",
+    // Other
+    "cook", "ra", "sipr", "wma", "wmav1", "wmav2", "wmapro",
+];
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TorrentFile {
@@ -33,6 +47,8 @@ pub struct AudioTrack {
     pub language: Option<String>,
     pub codec: Option<String>,
     pub name: Option<String>,
+    #[serde(default)]
+    pub needs_transcoding: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -56,6 +72,10 @@ pub struct MkvMetadata {
     pub audio_tracks: Vec<AudioTrack>,
     pub subtitle_tracks: Vec<SubtitleTrack>,
     pub chapters: Vec<Chapter>,
+    #[serde(default)]
+    pub needs_audio_transcoding: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcoded_audio_url: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -82,24 +102,37 @@ pub struct StreamInfo {
 
 #[derive(Clone, Serialize)]
 pub struct StreamStatus {
-    pub status: String, // "initializing", "ready", "error"
+    pub status: String, // "initializing", "ready", "transcoding", "error"
     pub progress_bytes: u64,
     pub total_bytes: u64,
     pub peers: usize,
     pub download_speed: u64,
     pub stream_info: Option<StreamInfo>,
-    pub state: String, // "checking", "downloading"
+    pub state: String, // "checking", "downloading", "transcoding"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode_progress: Option<f32>, // 0.0 - 100.0
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub session: Arc<Session>,
     pub hls_cache: Arc<Mutex<HashMap<String, PathBuf>>>,
+    pub transcode_states: Arc<RwLock<HashMap<(usize, usize), TranscodeState>>>,
+    pub metadata_cache: Arc<RwLock<HashMap<(usize, usize), MkvMetadata>>>,
 }
 
 struct TorrentEntry {
     magnet_url: String,
     session_id: Option<usize>, // None if not yet added to session
+}
+
+// Transcoding state for a specific file
+#[derive(Clone)]
+pub struct TranscodeState {
+    pub progress: f32,
+    pub output_path: Option<PathBuf>,
+    pub completed: bool,
+    pub error: Option<String>,
 }
 
 pub struct TorrentManager {
@@ -108,6 +141,10 @@ pub struct TorrentManager {
     torrents: Arc<RwLock<HashMap<usize, TorrentEntry>>>,
     next_id: Arc<RwLock<usize>>,
     http_addr: SocketAddr,
+    // Key: (handle_id, file_index) -> TranscodeState
+    transcode_states: Arc<RwLock<HashMap<(usize, usize), TranscodeState>>>,
+    // Cache metadata by (session_id, file_index)
+    metadata_cache: Arc<RwLock<HashMap<(usize, usize), MkvMetadata>>>,
 }
 
 async fn get_file_metadata(
@@ -185,7 +222,7 @@ async fn get_file_metadata(
     let mut buffer = vec![0u8; chunk_size];
     
     let mut consecutive_empty_reads = 0;
-    let max_empty_reads = 50; // Allow up to 50 empty reads (with delays) before giving up
+    let max_empty_reads = 150; // Allow up to 150 empty reads (30 seconds total with delays) for slower connections
     
     while total_read < max_size {
         let bytes_read = match stream.read(&mut buffer).await {
@@ -255,6 +292,13 @@ async fn get_file_metadata(
 
     tracing::info!("Cleaning up temp file...");
     let _ = tokio::fs::remove_file(&temp_file_path).await;
+    
+    // Cache the metadata for later use by get_stream_status
+    {
+        let mut cache = state.metadata_cache.write().await;
+        cache.insert((session_id, file_id), metadata.clone());
+        tracing::info!("Cached metadata for session_id={}, file_id={}", session_id, file_id);
+    }
     
     tracing::info!("Returning metadata response");
     axum::Json(metadata).into_response()
@@ -441,16 +485,24 @@ impl TorrentManager {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let http_addr = listener.local_addr()?;
+        
+        let transcode_states: Arc<RwLock<HashMap<(usize, usize), TranscodeState>>> = 
+            Arc::new(RwLock::new(HashMap::new()));
+        let metadata_cache: Arc<RwLock<HashMap<(usize, usize), MkvMetadata>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         let state = AppState {
             session: session.clone(),
             hls_cache: Arc::new(Mutex::new(HashMap::new())),
+            transcode_states: transcode_states.clone(),
+            metadata_cache: metadata_cache.clone(),
         };
 
         let app = Router::new()
             .route("/torrents/{session_id}/stream/{file_id}", get(stream_file))
             .route("/torrents/{session_id}/metadata/{file_id}", get(get_file_metadata))
             .route("/torrents/{session_id}/subtitles/{file_id}/{track_index}", get(get_subtitle_track))
+            .route("/torrents/{session_id}/transcoded-audio/{file_id}", get(serve_transcoded_audio))
             .route("/torrents/{session_id}/dash/{file_id}/manifest.mpd", get(crate::dash::dash_manifest))
             .route("/torrents/{session_id}/dash/{file_id}/video/init.mp4", get(crate::dash::dash_video_init))
             .route("/torrents/{session_id}/dash/{file_id}/video/segment/{segment_num}", get(crate::dash::dash_video_segment))
@@ -470,6 +522,8 @@ impl TorrentManager {
             torrents,
             next_id,
             http_addr,
+            transcode_states,
+            metadata_cache,
         })
     }
 
@@ -775,19 +829,85 @@ impl TorrentManager {
             );
         }
         
+        // Check transcoding state
+        let transcode_progress = {
+            let states = self.transcode_states.read().await;
+            states.get(&(session_id, file_index)).map(|s| s.progress)
+        };
+        
+        let transcode_completed = {
+            let states = self.transcode_states.read().await;
+            states.get(&(session_id, file_index)).map(|s| s.completed).unwrap_or(false)
+        };
+        
         let stream_info = if is_ready {
-             // Extract MKV metadata if it's an MKV file and already downloaded
-            let metadata = if file_name.to_lowercase().ends_with(".mkv") {
-                // Check if file is already fully downloaded
+             // Extract MKV metadata if it's an MKV file
+            let mut metadata = if file_name.to_lowercase().ends_with(".mkv") {
+                // If fully downloaded, use the actual file
                 if stats.progress_bytes >= stats.total_bytes && stats.total_bytes > 0 {
                     let file_path = self.download_dir.join(&file_name_path);
                     extract_mkv_metadata_ffprobe(&file_path).await.ok()
                 } else {
-                    None
+                    // Try to get from metadata cache (populated by /metadata/ endpoint)
+                    let cache = self.metadata_cache.read().await;
+                    cache.get(&(session_id, file_index)).cloned()
                 }
             } else {
                 None
             };
+            
+            // If transcoding is needed and not yet started, start it
+            if let Some(ref mut meta) = metadata {
+                if meta.needs_audio_transcoding {
+                    let transcode_key = (session_id, file_index);
+                    let states = self.transcode_states.read().await;
+                    let transcoding_started = states.contains_key(&transcode_key);
+                    drop(states);
+                    
+                    // Start transcoding if file is downloaded (finished or has all bytes)
+                    let file_downloaded = stats.finished || 
+                        (stats.total_bytes > 0 && stats.progress_bytes >= stats.total_bytes);
+                    
+                    if !transcoding_started && file_downloaded {
+                        // Start transcoding in background
+                        let file_path = self.download_dir.join(&file_name_path);
+                        let output_path = std::env::temp_dir()
+                            .join(format!("magnolia_audio_{}_{}.aac", session_id, file_index));
+                        
+                        tracing::info!("File path for transcoding: {:?}", file_path);
+                        tracing::info!("File exists: {}", file_path.exists());
+                        
+                        let transcode_states = self.transcode_states.clone();
+                        
+                        tracing::info!("Starting audio transcoding for {}", file_name);
+                        tokio::spawn(async move {
+                            if let Err(e) = transcode_audio_track(
+                                &file_path,
+                                &output_path,
+                                0, // Default to first audio track
+                                transcode_states,
+                                session_id,
+                                file_index,
+                            ).await {
+                                tracing::error!("Transcoding failed: {}", e);
+                            }
+                        });
+                    } else if !transcoding_started {
+                        tracing::info!("Waiting for download to complete before transcoding. finished={}, progress={}/{}", 
+                            stats.finished, stats.progress_bytes, stats.total_bytes);
+                    }
+                    
+                    // Add transcoded audio URL if transcoding is complete
+                    if transcode_completed {
+                        meta.transcoded_audio_url = Some(format!(
+                            "http://{}/torrents/{}/transcoded-audio/{}",
+                            self.http_addr,
+                            session_id,
+                            file_index
+                        ));
+                    }
+                }
+            }
 
             Some(StreamInfo {
                 url: format!(
@@ -804,20 +924,51 @@ impl TorrentManager {
             None
         };
 
-        let state = if stats.live.is_none() {
+        // Determine the current state
+        let state = if transcode_progress.is_some() && !transcode_completed {
+            "transcoding".to_string()
+        } else if stats.live.is_none() {
             "checking".to_string()
         } else {
             "downloading".to_string()
         };
+        
+        // Check if transcoding is needed from either stream_info metadata or the cache
+        let needs_transcoding_from_stream = stream_info.as_ref()
+            .and_then(|s| s.metadata.as_ref())
+            .map(|m| m.needs_audio_transcoding)
+            .unwrap_or(false);
+        
+        let needs_transcoding_from_cache = {
+            let cache = self.metadata_cache.read().await;
+            cache.get(&(session_id, file_index))
+                .map(|m| m.needs_audio_transcoding)
+                .unwrap_or(false)
+        };
+        
+        let needs_audio_transcoding = needs_transcoding_from_stream || needs_transcoding_from_cache;
+        
+        // Determine status
+        let status = if !is_ready {
+            "initializing".to_string()
+        } else if needs_audio_transcoding && !transcode_completed {
+            "transcoding".to_string()
+        } else {
+            "ready".to_string()
+        };
+        
+        tracing::debug!("Stream status: is_ready={}, needs_transcoding={}, transcode_completed={}, status={}", 
+            is_ready, needs_audio_transcoding, transcode_completed, status);
 
         Ok(StreamStatus {
-            status: if is_ready { "ready".to_string() } else { "initializing".to_string() },
+            status,
             progress_bytes: stats.progress_bytes,
             total_bytes: stats.total_bytes,
             peers: stats.live.as_ref().map(|l| l.snapshot.peer_stats.live).unwrap_or(0),
             download_speed: stats.live.as_ref().map(|l| l.download_speed.mbps as u64).unwrap_or(0),
             stream_info,
             state,
+            transcode_progress,
         })
     }
     
@@ -888,6 +1039,39 @@ impl TorrentManager {
         }
         Ok(())
     }
+
+    pub async fn get_transcoded_audio(&self, session_id: usize, file_index: usize) -> Result<Option<Vec<u8>>, String> {
+        // Check if transcoding is complete and get the output path
+        let output_path = {
+            let states = self.transcode_states.read().await;
+            if let Some(transcode_state) = states.get(&(session_id, file_index)) {
+                if !transcode_state.completed {
+                    return Err("Transcoding not complete".to_string());
+                }
+                transcode_state.output_path.clone()
+            } else {
+                return Err("No transcoding in progress for this file".to_string());
+            }
+        };
+
+        let output_path = match output_path {
+            Some(p) => p,
+            None => return Err("Transcoded file path not found".to_string()),
+        };
+
+        if !output_path.exists() {
+            return Err("Transcoded file not found on disk".to_string());
+        }
+
+        // Read the entire file into memory
+        match tokio::fs::read(&output_path).await {
+            Ok(data) => {
+                tracing::info!("Loaded transcoded audio: {} bytes from {:?}", data.len(), output_path);
+                Ok(Some(data))
+            }
+            Err(e) => Err(format!("Failed to read transcoded audio file: {}", e)),
+        }
+    }
 }
 
 async fn extract_mkv_metadata_ffprobe(file_path: &std::path::Path) -> Result<MkvMetadata> {
@@ -949,6 +1133,8 @@ async fn extract_mkv_metadata_ffprobe(file_path: &std::path::Path) -> Result<Mkv
             match codec_type {
                 Some("audio") => {
                     let codec_name = stream.get("codec_name").and_then(|c| c.as_str()).unwrap_or("unknown");
+                    let codec_long_name = stream.get("codec_long_name").and_then(|c| c.as_str()).unwrap_or("");
+                    let profile = stream.get("profile").and_then(|p| p.as_str()).unwrap_or("");
                     let language = stream.get("tags")
                         .and_then(|t| t.get("language"))
                         .and_then(|l| l.as_str())
@@ -959,11 +1145,35 @@ async fn extract_mkv_metadata_ffprobe(file_path: &std::path::Path) -> Result<Mkv
                         .and_then(|t| t.as_str())
                         .map(|s| s.to_string());
                     
+                    // Check if this codec needs transcoding (check codec name, long name, and profile)
+                    let codec_lower = codec_name.to_lowercase();
+                    let long_name_lower = codec_long_name.to_lowercase();
+                    let profile_lower = profile.to_lowercase();
+                    
+                    let needs_transcoding = UNSUPPORTED_AUDIO_CODECS.iter().any(|unsupported| {
+                        codec_lower == *unsupported 
+                            || codec_lower.contains(unsupported)
+                            || long_name_lower.contains(unsupported)
+                            || profile_lower.contains(unsupported)
+                    });
+                    
+                    // Also check if it's NOT a known supported codec (whitelist approach as fallback)
+                    let is_known_supported = matches!(codec_lower.as_str(), 
+                        "aac" | "mp3" | "opus" | "vorbis" | "mp2" | "mp1" | "flac"
+                    );
+                    
+                    // If codec is unknown and not in supported list, mark for transcoding
+                    let needs_transcoding = needs_transcoding || (!is_known_supported && codec_lower != "unknown");
+                    
+                    tracing::info!("Audio track {}: codec='{}' ({}), profile='{}', needs_transcoding={}", 
+                        audio_index, codec_name, codec_long_name, profile, needs_transcoding);
+                    
                     audio_tracks.push(AudioTrack {
                         index: audio_index,
                         language: Some(language),
                         codec: Some(codec_name.to_string()),
                         name: title,
+                        needs_transcoding,
                     });
                     audio_index += 1;
                 }
@@ -1018,11 +1228,234 @@ async fn extract_mkv_metadata_ffprobe(file_path: &std::path::Path) -> Result<Mkv
     tracing::info!("Extracted {} audio tracks, {} subtitle tracks, {} chapters", 
         audio_tracks.len(), subtitle_tracks.len(), chapters.len());
     
+    // Check if ANY audio track needs transcoding (check all tracks, not just first)
+    let needs_audio_transcoding = audio_tracks.iter()
+        .any(|t| t.needs_transcoding);
+    
+    // Log all audio codecs for debugging
+    for track in &audio_tracks {
+        tracing::info!("Audio track {}: codec={:?}, needs_transcoding={}", 
+            track.index, track.codec, track.needs_transcoding);
+    }
+    
+    if needs_audio_transcoding {
+        tracing::info!("Audio transcoding required - at least one track has unsupported codec");
+    } else {
+        tracing::info!("No audio transcoding required - all tracks have supported codecs");
+    }
+    
     Ok(MkvMetadata {
         audio_tracks,
         subtitle_tracks,
         chapters,
+        needs_audio_transcoding,
+        transcoded_audio_url: None,
     })
+}
+
+// Transcode audio to AAC using ffmpeg-sidecar
+async fn transcode_audio_track(
+    input_path: &std::path::Path,
+    output_path: &std::path::Path,
+    audio_track_index: usize,
+    transcode_states: Arc<RwLock<HashMap<(usize, usize), TranscodeState>>>,
+    session_id: usize,
+    file_id: usize,
+) -> Result<()> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    
+    tracing::info!("Starting audio transcoding: {:?} -> {:?} (track {})", 
+        input_path, output_path, audio_track_index);
+    
+    // Get duration for progress calculation
+    let duration = get_media_duration(input_path).await.unwrap_or(0.0);
+    tracing::info!("Media duration: {} seconds", duration);
+    
+    // Initialize transcode state
+    {
+        let mut states = transcode_states.write().await;
+        states.insert((session_id, file_id), TranscodeState {
+            progress: 0.0,
+            output_path: Some(output_path.to_path_buf()),
+            completed: false,
+            error: None,
+        });
+    }
+    
+    // Use ffmpeg-sidecar to get the ffmpeg path
+    let ffmpeg_exe = ffmpeg_path();
+    
+    let mut cmd = tokio::process::Command::new(ffmpeg_exe);
+    cmd.args(&[
+        "-y",  // Overwrite output
+        "-i", input_path.to_str().unwrap(),
+        "-map", &format!("0:a:{}", audio_track_index), // Select specific audio track
+        "-c:a", "aac",  // Transcode to AAC
+        "-b:a", "192k", // Good quality
+        "-progress", "pipe:1", // Output progress to stdout
+        "-nostats",
+        output_path.to_str().unwrap(),
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    
+    let mut child = cmd.spawn().context("Failed to spawn ffmpeg")?;
+    
+    let stdout = child.stdout.take().context("Failed to get stdout")?;
+    let mut reader = BufReader::new(stdout).lines();
+    
+    // Parse progress output
+    while let Ok(Some(line)) = reader.next_line().await {
+        if line.starts_with("out_time_ms=") {
+            if let Ok(time_ms) = line.trim_start_matches("out_time_ms=").parse::<i64>() {
+                let current_time = time_ms as f64 / 1_000_000.0;
+                let progress = if duration > 0.0 {
+                    ((current_time / duration) * 100.0).min(99.0)
+                } else {
+                    0.0
+                };
+                
+                // Update progress
+                let mut states = transcode_states.write().await;
+                if let Some(state) = states.get_mut(&(session_id, file_id)) {
+                    state.progress = progress as f32;
+                }
+                
+                tracing::debug!("Transcode progress: {:.1}%", progress);
+            }
+        }
+    }
+    
+    // Wait for completion
+    let status = child.wait().await.context("Failed to wait for ffmpeg")?;
+    
+    if status.success() {
+        tracing::info!("Audio transcoding completed successfully");
+        let mut states = transcode_states.write().await;
+        if let Some(state) = states.get_mut(&(session_id, file_id)) {
+            state.progress = 100.0;
+            state.completed = true;
+        }
+        Ok(())
+    } else {
+        let error_msg = "FFmpeg transcoding failed".to_string();
+        tracing::error!("{}", error_msg);
+        let mut states = transcode_states.write().await;
+        if let Some(state) = states.get_mut(&(session_id, file_id)) {
+            state.error = Some(error_msg.clone());
+        }
+        Err(anyhow::anyhow!(error_msg))
+    }
+}
+
+// Get media duration using ffprobe
+async fn get_media_duration(path: &std::path::Path) -> Result<f64> {
+    use tokio::process::Command;
+    
+    let output = Command::new("ffprobe")
+        .args(&[
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .await
+        .context("Failed to run ffprobe")?;
+    
+    if output.status.success() {
+        let duration_str = String::from_utf8_lossy(&output.stdout);
+        duration_str.trim().parse::<f64>().context("Failed to parse duration")
+    } else {
+        Err(anyhow::anyhow!("ffprobe failed"))
+    }
+}
+
+// HTTP handler to serve transcoded audio file
+async fn serve_transcoded_audio(
+    Path((session_id, file_id)): Path<(usize, usize)>,
+    headers: HeaderMap,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    tracing::info!("Transcoded audio request: session_id={}, file_id={}", session_id, file_id);
+    
+    // Check if transcoding is complete
+    let output_path = {
+        let states = state.transcode_states.read().await;
+        if let Some(transcode_state) = states.get(&(session_id, file_id)) {
+            if !transcode_state.completed {
+                return (StatusCode::SERVICE_UNAVAILABLE, "Transcoding not complete").into_response();
+            }
+            transcode_state.output_path.clone()
+        } else {
+            return (StatusCode::NOT_FOUND, "No transcoding in progress").into_response();
+        }
+    };
+    
+    let output_path = match output_path {
+        Some(p) => p,
+        None => return (StatusCode::NOT_FOUND, "Transcoded file path not found").into_response(),
+    };
+    
+    if !output_path.exists() {
+        return (StatusCode::NOT_FOUND, "Transcoded file not found").into_response();
+    }
+    
+    // Get file size
+    let file_size = match tokio::fs::metadata(&output_path).await {
+        Ok(m) => m.len(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get file size").into_response(),
+    };
+    
+    // Handle range requests
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    
+    let (start, end) = if let Some(range) = range_header {
+        if let Some(bytes_range) = range.strip_prefix("bytes=") {
+            let parts: Vec<&str> = bytes_range.split('-').collect();
+            let start: u64 = parts.get(0).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let end: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(file_size - 1);
+            (start, end.min(file_size - 1))
+        } else {
+            (0, file_size - 1)
+        }
+    } else {
+        (0, file_size - 1)
+    };
+    
+    let content_length = end - start + 1;
+    
+    // Open file and seek
+    let mut file = match tokio::fs::File::open(&output_path).await {
+        Ok(f) => f,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to open file").into_response(),
+    };
+    
+    if start > 0 {
+        if let Err(_) = file.seek(std::io::SeekFrom::Start(start)).await {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to seek").into_response();
+        }
+    }
+    
+    let stream = tokio_util::io::ReaderStream::new(file.take(content_length));
+    let body = Body::from_stream(stream);
+    
+    let status = if range_header.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "audio/aac")
+        .header(header::CONTENT_LENGTH, content_length.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_RANGE, format!("bytes {}-{}/{}", start, end, file_size))
+        .body(body)
+        .unwrap()
+        .into_response()
 }
 
 // Tauri commands

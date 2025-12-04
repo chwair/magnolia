@@ -8,7 +8,7 @@ mod tracking;
 mod dash;
 mod media_cache;
 
-use search::{nyaa::NyaaProvider, x1337::X1337Provider, piratebay::PirateBayProvider, 
+use search::{nyaa::NyaaProvider, limetorrents::LimeTorrentsProvider, piratebay::PirateBayProvider, 
              SearchProvider};
 use std::sync::Arc;
 use tauri::{Manager, State};
@@ -22,64 +22,17 @@ async fn search_nyaa(query: String) -> Result<Vec<search::SearchResult>, String>
     provider.search(&query).await.map_err(|e| e.to_string())
 }
 
-async fn search_by_media_type(query: &str, media_type: &Option<String>) -> Result<Vec<search::SearchResult>, String> {
-    if let Some(ref mt) = media_type {
-        println!("Media type: {}", mt);
-        if mt == "anime" {
-            // Use Nyaa for anime
-            println!("Using Nyaa provider for anime");
-            let provider = NyaaProvider::new();
-            provider.search(query).await.map_err(|e| e.to_string())
-        } else {
-            // Use 1337x and PirateBay for all non-anime content (movies and TV)
-            println!("Using 1337x and ThePirateBay for non-anime");
-            let mut all_results = Vec::new();
-            
-            // Try 1337x
-            println!("Searching 1337x...");
-            let x1337 = X1337Provider::new();
-            match x1337.search(query).await {
-                Ok(mut results) => {
-                    println!("1337x returned {} results", results.len());
-                    all_results.append(&mut results);
-                }
-                Err(e) => {
-                    println!("1337x error: {}", e);
-                }
-            }
-            
-            // Add PirateBay results
-            println!("Searching ThePirateBay...");
-            let tpb = PirateBayProvider::new();
-            match tpb.search(query).await {
-                Ok(mut results) => {
-                    println!("ThePirateBay returned {} results", results.len());
-                    all_results.append(&mut results);
-                }
-                Err(e) => {
-                    println!("ThePirateBay error: {}", e);
-                }
-            }
-            
-            Ok(all_results)
-        }
-    } else {
-        // Default to Nyaa if no media type specified
-        let provider = NyaaProvider::new();
-        provider.search(query).await.map_err(|e| e.to_string())
-    }
-}
-
 #[tauri::command]
 async fn search_nyaa_filtered(
     query: String,
     season: Option<u32>,
     episode: Option<u32>,
-    is_movie: bool,
+    _is_movie: bool,
     media_type: Option<String>, // "anime", "tv", "movie"
-    tracker_preference: Option<Vec<String>>, // ["nyaa", "1337x", ...] or None for auto
+    tracker_preference: Option<Vec<String>>, // ["nyaa", "limetorrents", ...] or None for auto
+    imdb_id: Option<String>, // For EZTV: pass IMDB ID like "tt1234567" or "1234567"
 ) -> Result<Vec<search::SearchResult>, String> {
-    println!("search_nyaa_filtered called with tracker_preference: {:?}", tracker_preference);
+    println!("search_nyaa_filtered called with tracker_preference: {:?}, imdb_id: {:?}", tracker_preference, imdb_id);
     
     // Normalize query
     let normalized_query = query
@@ -87,13 +40,28 @@ async fn search_nyaa_filtered(
         .replace(":", " ")
         .replace("_", " ");
     
+    // Determine if this is auto mode
+    let is_auto_mode = match &tracker_preference {
+        Some(prefs) => prefs.is_empty(),
+        None => true,
+    };
+    
+    let is_anime = media_type.as_deref() == Some("anime");
+    
     // Determine which trackers to use
     let trackers: Vec<String> = if let Some(prefs) = tracker_preference {
         if prefs.is_empty() {
             // Empty array means auto mode
             match media_type.as_deref() {
                 Some("anime") => vec!["nyaa".to_string()],
-                _ => vec!["1337x".to_string(), "thepiratebay".to_string()],
+                // For regular TV/movies: use limetorrents, thepiratebay, and eztv (if imdb available)
+                _ => {
+                    let mut t = vec!["limetorrents".to_string(), "thepiratebay".to_string()];
+                    if imdb_id.is_some() {
+                        t.push("eztv".to_string());
+                    }
+                    t
+                }
             }
         } else {
             // Use specified trackers
@@ -103,63 +71,98 @@ async fn search_nyaa_filtered(
         // null/undefined means auto mode
         match media_type.as_deref() {
             Some("anime") => vec!["nyaa".to_string()],
-            _ => vec!["1337x".to_string(), "thepiratebay".to_string()],
+            _ => {
+                let mut t = vec!["limetorrents".to_string(), "thepiratebay".to_string()];
+                if imdb_id.is_some() {
+                    t.push("eztv".to_string());
+                }
+                t
+            }
         }
     };
     
     println!("Using trackers: {:?}", trackers);
     
-    // Search all trackers in parallel
-    let mut handles = vec![];
-    
-    for tracker in trackers {
-        // Skip EZTV as it requires IMDb ID (use search_eztv_by_imdb instead)
-        if tracker == "eztv" {
-            println!("Skipping EZTV in regular search (requires IMDb ID)");
-            continue;
+    // Helper function to search trackers
+    async fn search_trackers(
+        trackers: Vec<String>,
+        query: String,
+        imdb_id: Option<String>,
+    ) -> Vec<search::SearchResult> {
+        let mut handles = vec![];
+        
+        for tracker in trackers {
+            let query_clone = query.clone();
+            let imdb_clone = imdb_id.clone();
+            
+            let handle = tokio::spawn(async move {
+                let result: Result<Vec<search::SearchResult>, Box<dyn std::error::Error + Send + Sync>> = match tracker.as_str() {
+                    "nyaa" => {
+                        println!("Searching Nyaa...");
+                        NyaaProvider::new().search(&query_clone).await
+                    }
+                    "limetorrents" => {
+                        println!("Searching LimeTorrents...");
+                        LimeTorrentsProvider::new().search(&query_clone).await
+                    }
+                    "thepiratebay" => {
+                        println!("Searching ThePirateBay...");
+                        let provider = PirateBayProvider::new();
+                        if let Some(ref imdb) = imdb_clone {
+                            provider.search_with_imdb(&query_clone, Some(imdb)).await
+                        } else {
+                            provider.search(&query_clone).await
+                        }
+                    }
+                    "eztv" => {
+                        if let Some(ref imdb) = imdb_clone {
+                            println!("Searching EZTV with IMDB ID: {}", imdb);
+                            search::eztv::EZTVProvider::new().search_by_imdb(imdb).await
+                        } else {
+                            println!("EZTV requires IMDB ID, skipping");
+                            Ok(vec![])
+                        }
+                    }
+                    _ => {
+                        println!("Unknown tracker: {}", tracker);
+                        Ok(vec![])
+                    }
+                };
+                
+                match result {
+                    Ok(results) => {
+                        println!("{} returned {} results", tracker, results.len());
+                        results
+                    }
+                    Err(e) => {
+                        println!("{} error: {}", tracker, e);
+                        vec![]
+                    }
+                }
+            });
+            handles.push(handle);
         }
         
-        let query_clone = normalized_query.clone();
-        let handle = tokio::spawn(async move {
-            let result: Result<Vec<search::SearchResult>, Box<dyn std::error::Error + Send + Sync>> = match tracker.as_str() {
-                "nyaa" => {
-                    println!("Searching Nyaa...");
-                    NyaaProvider::new().search(&query_clone).await
-                }
-                "1337x" => {
-                    println!("Searching 1337x...");
-                    X1337Provider::new().search(&query_clone).await
-                }
-                "thepiratebay" => {
-                    println!("Searching ThePirateBay...");
-                    PirateBayProvider::new().search(&query_clone).await
-                }
-                _ => {
-                    println!("Unknown tracker: {}", tracker);
-                    Ok(vec![])
-                }
-            };
-            
-            match result {
-                Ok(results) => {
-                    println!("{} returned {} results", tracker, results.len());
-                    results
-                }
-                Err(e) => {
-                    println!("{} error: {}", tracker, e);
-                    vec![]
-                }
+        let mut all_results = Vec::new();
+        for handle in handles {
+            if let Ok(results) = handle.await {
+                all_results.extend(results);
             }
-        });
-        handles.push(handle);
+        }
+        all_results
     }
     
-    // Wait for all searches to complete
-    let mut all_results = Vec::new();
-    for handle in handles {
-        if let Ok(results) = handle.await {
-            all_results.extend(results);
+    // Search with primary trackers
+    let mut all_results = search_trackers(trackers, normalized_query.clone(), imdb_id.clone()).await;
+    
+    // If anime auto mode returned no results, fallback to regular trackers
+    if is_auto_mode && is_anime && all_results.is_empty() {
+        println!("Anime search returned no results, falling back to regular trackers");
+        let mut fallback_trackers = vec!["limetorrents".to_string(), "thepiratebay".to_string()];
+        if imdb_id.is_some() {
+            fallback_trackers.push("eztv".to_string());
         }
+        all_results = search_trackers(fallback_trackers, normalized_query.clone(), imdb_id.clone()).await;
     }
     
     println!("Total results before deduplication: {}", all_results.len());
@@ -176,39 +179,9 @@ async fn search_nyaa_filtered(
     
     println!("Total results after deduplication: {}", all_results.len());
     
-    // Filter results based on media type and requested episode/season
-    all_results.retain(|result| {
-        if is_movie {
-            true
-        } else {
-            match (season, episode) {
-                (Some(req_season), Some(req_episode)) => {
-                    if let Some(s) = result.season {
-                        if s != req_season {
-                            return false;
-                        }
-                        if result.is_batch {
-                            return true;
-                        }
-                        if let Some(e) = result.episode {
-                            return e == req_episode;
-                        }
-                        return true;
-                    } else {
-                        true
-                    }
-                }
-                (Some(req_season), None) => {
-                    if let Some(s) = result.season {
-                        s == req_season
-                    } else {
-                        true
-                    }
-                }
-                _ => true,
-            }
-        }
-    });
+    // Don't filter out results - just sort by relevance score
+    // This allows all EZTV results (and others) to be shown
+    // Matching season/episode will be prioritized via scoring
 
     // Sort by relevance score
     all_results.sort_by(|a, b| {
@@ -375,9 +348,11 @@ async fn save_audio_cache(
     cache_id: String,
     file_index: usize,
     track_index: usize,
-    data: Vec<u8>,
+    data: String,
 ) -> Result<(), String> {
-    cache.save_track(TrackType::Audio, &cache_id, file_index, track_index, data).await
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let bytes = STANDARD.decode(&data).map_err(|e| format!("Failed to decode base64: {}", e))?;
+    cache.save_track(TrackType::Audio, &cache_id, file_index, track_index, bytes).await
 }
 
 #[tauri::command]
@@ -386,8 +361,10 @@ async fn load_audio_cache(
     cache_id: String,
     file_index: usize,
     track_index: usize,
-) -> Result<Option<Vec<u8>>, String> {
-    cache.load_track(TrackType::Audio, &cache_id, file_index, track_index).await
+) -> Result<Option<String>, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let data = cache.load_track(TrackType::Audio, &cache_id, file_index, track_index).await?;
+    Ok(data.map(|bytes| STANDARD.encode(&bytes)))
 }
 
 #[tauri::command]
@@ -397,9 +374,20 @@ async fn clear_audio_cache(
     cache.clear_cache(TrackType::Audio).await
 }
 
+#[tauri::command]
+async fn load_transcoded_audio(
+    torrent_manager: State<'_, Arc<torrent::TorrentManager>>,
+    session_id: usize,
+    file_index: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    torrent_manager.get_transcoded_audio(session_id, file_index).await
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             let app_handle = app.handle();
             let app_data_dir = app_handle
@@ -463,7 +451,8 @@ fn main() {
             clear_subtitle_cache,
             save_audio_cache,
             load_audio_cache,
-            clear_audio_cache
+            clear_audio_cache,
+            load_transcoded_audio
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

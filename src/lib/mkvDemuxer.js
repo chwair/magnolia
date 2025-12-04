@@ -554,21 +554,40 @@ export class MKVDemuxer {
           return assHeader;
         }
       } else if (this.demuxer) {
-        // For other subtitle formats (SRT, etc.)
+        // For other subtitle formats (SRT, SubRip, etc.)
         try {
           console.log('Reading non-ASS subtitle packets with readAVPacket...');
-          const stream = this.demuxer.readAVPacket(0, track.id, 3); // 3 = AVMEDIA_TYPE_SUBTITLE
+          const codec = track.codec?.toLowerCase() || '';
+          const streamIndex = track.rawStream?.index ?? track.id;
+          
+          const stream = this.demuxer.readAVPacket(
+            0, // start time
+            this.mediaInfo.duration || 0, // end time
+            3, // AVMediaType.AVMEDIA_TYPE_SUBTITLE
+            streamIndex, // stream index
+            1 // seek flag
+          );
           const reader = stream.getReader();
-          let subtitleData = '';
           const decoder = new TextDecoder('utf-8');
+          const subtitleEntries = [];
+          let packetCount = 0;
+          const maxPackets = 100000;
 
           try {
-            while (true) {
+            while (packetCount < maxPackets) {
               const { done, value } = await reader.read();
               if (done) break;
+              packetCount++;
 
-              if (value && value.data) {
-                subtitleData += decoder.decode(value.data);
+              if (value && value.data && value.data.byteLength > 0) {
+                const text = decoder.decode(value.data).trim();
+                if (text) {
+                  subtitleEntries.push({
+                    start: value.timestamp || 0,
+                    end: (value.timestamp || 0) + (value.duration || 0),
+                    text: text
+                  });
+                }
               }
             }
           } finally {
@@ -579,7 +598,30 @@ export class MKVDemuxer {
             }
           }
 
-          return subtitleData;
+          console.log(`Extracted ${subtitleEntries.length} subtitle entries for codec: ${codec}`);
+
+          // Build SRT format output
+          if (codec === 'srt' || codec === 'subrip' || codec === 'sub') {
+            // Format as SRT
+            const formatSRTTime = (seconds) => {
+              const hours = Math.floor(seconds / 3600);
+              const minutes = Math.floor((seconds % 3600) / 60);
+              const secs = Math.floor(seconds % 60);
+              const millis = Math.floor((seconds % 1) * 1000);
+              return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')},${millis.toString().padStart(3, '0')}`;
+            };
+
+            let srtOutput = '';
+            subtitleEntries.forEach((entry, index) => {
+              srtOutput += `${index + 1}\n`;
+              srtOutput += `${formatSRTTime(entry.start)} --> ${formatSRTTime(entry.end)}\n`;
+              srtOutput += `${entry.text}\n\n`;
+            });
+            return srtOutput;
+          }
+
+          // For other formats, just return the raw text concatenated
+          return subtitleEntries.map(e => e.text).join('\n');
         } catch (streamError) {
           console.error('Error reading subtitle stream:', streamError);
           return null;

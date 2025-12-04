@@ -195,8 +195,13 @@ export class SRTSubtitleRenderer {
 
   show() {
     this.isVisible = true;
+    if (!this.container) {
+      this.initialize();
+    }
     if (this.container) {
       this.container.style.display = 'block';
+      // Force update to show current subtitle if any
+      this.updateSubtitles();
     }
   }
 

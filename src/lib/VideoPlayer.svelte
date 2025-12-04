@@ -21,29 +21,28 @@
   export let magnetLink = null;
   export let initialTimestamp = 0;
   
-  // Reset initialization flag when src changes
-  $: if (src) {
-    demuxerInitialized = false;
-    hasSeekedToInitial = false;
-    externalSubtitles = [];
-    lastSubtitleFetchKey = null;
-    selectedSubtitleTrack = -1;
-  }
+  // Track when we should reset state (only on actual new sources, not internal src updates)
+  let lastInitializedSrc = null;
+  
   export let mediaId = null;
   export let mediaType = null;
   export let seasonNum = null;
   export let episodeNum = null;
 
   let loading = true;
+  let loadingPhase = "initializing"; // "initializing" | "buffering" | "metadata" | "transcoding" | "demuxing" | "ready"
   let loadingStatus = {
     progress: 0,
     total: 0,
     speed: 0,
     peers: 0,
-    status: "Initializing...",
+    status: "Initializing stream...",
     state: "checking",
+    phaseProgress: 0, // 0-100 for current phase
   };
   let pollInterval;
+  let needsAudioTranscoding = false; // Track if audio transcoding is required
+  let metadataFetched = false; // Track if we've already fetched metadata during polling
 
   const dispatch = createEventDispatcher();
 
@@ -143,15 +142,15 @@
   // Load audio from Tauri filesystem cache
   async function loadCachedAudio(cacheId, fileIndex, trackIndex) {
     try {
-      const data = await invoke('load_audio_cache', { 
+      const base64Data = await invoke('load_audio_cache', { 
         cacheId: cacheId, 
         fileIndex: Number(fileIndex), 
         trackIndex: Number(trackIndex) 
       });
-      if (data) {
-        console.log(`[Audio Cache] Loaded ${data.length} bytes from filesystem`);
-        // Convert array back to Uint8Array
-        return new Uint8Array(data);
+      if (base64Data) {
+        const audioBuffer = base64ToUint8Array(base64Data);
+        console.log(`[Audio Cache] Loaded ${audioBuffer.length} bytes from filesystem`);
+        return audioBuffer;
       }
       return null;
     } catch (error) {
@@ -160,14 +159,37 @@
     }
   }
   
+  // Helper to convert Uint8Array to base64
+  function uint8ArrayToBase64(uint8Array) {
+    let binary = '';
+    const chunkSize = 8192;
+    for (let i = 0; i < uint8Array.length; i += chunkSize) {
+      const chunk = uint8Array.subarray(i, Math.min(i + chunkSize, uint8Array.length));
+      binary += String.fromCharCode.apply(null, chunk);
+    }
+    return btoa(binary);
+  }
+  
+  // Helper to convert base64 to Uint8Array
+  function base64ToUint8Array(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+  
   // Save audio to Tauri filesystem cache
   async function saveCachedAudio(cacheId, fileIndex, trackIndex, audioBuffer) {
     try {
+      // Convert to base64 for efficient transfer (Array.from is too slow for large files)
+      const base64Data = uint8ArrayToBase64(audioBuffer);
       await invoke('save_audio_cache', { 
         cacheId: cacheId, 
         fileIndex: Number(fileIndex), 
         trackIndex: Number(trackIndex),
-        data: Array.from(audioBuffer)
+        data: base64Data
       });
       console.log(`[Audio Cache] Saved ${audioBuffer.length} bytes to filesystem`);
     } catch (error) {
@@ -207,17 +229,17 @@
     videoElement.volume = volume;
   }
   
-  // Sync audio player volume when it exists (for extracted audio tracks)
-  $: if (audioPlayer && audioPlayer instanceof Audio && selectedAudioTrack > 0) {
+  // Sync audio player volume when it exists (for extracted/transcoded audio tracks)
+  $: if (audioPlayer && audioPlayer instanceof Audio && (selectedAudioTrack > 0 || needsAudioTranscoding)) {
     audioPlayer.volume = volume;
     audioPlayer.muted = muted;
   }
   
-  // Mute video element when using extracted audio (track > 0)
-  $: if (videoElement && selectedAudioTrack > 0 && audioPlayer) {
+  // Mute video element when using extracted audio (track > 0) or transcoded audio
+  $: if (videoElement && (selectedAudioTrack > 0 || needsAudioTranscoding) && audioPlayer) {
     videoElement.muted = true;
-  } else if (videoElement && selectedAudioTrack === 0) {
-    // Unmute video element when using native audio (track 0)
+  } else if (videoElement && selectedAudioTrack === 0 && !needsAudioTranscoding) {
+    // Unmute video element when using native audio (track 0) and no transcoding
     videoElement.muted = muted;
   }
 
@@ -230,7 +252,15 @@
     .sort((a, b) => b.start_time - a.start_time)[0];
 
   // Initialize demuxer when src changes
-  $: if (src && !demuxerInitialized) {
+  $: if (src && src !== lastInitializedSrc) {
+    lastInitializedSrc = src;
+    demuxerInitialized = false;
+    hasSeekedToInitial = false;
+    externalSubtitles = [];
+    lastSubtitleFetchKey = null;
+    selectedSubtitleTrack = -1;
+    needsAudioTranscoding = false;
+    metadataFetched = false;
     initializeDemuxer();
   }
 
@@ -275,6 +305,9 @@
     // Check if video source is from torrent streaming - fetch metadata from backend
     if (src && src.includes('/torrents/') && src.includes('/stream/')) {
       console.log("Torrent stream detected, fetching metadata from backend");
+      loadingPhase = "metadata";
+      loadingStatus.status = "Extracting video metadata...";
+      loadingStatus.phaseProgress = 20;
       
       // Extract session_id and file_id from URL
       // URL format: http://localhost:PORT/torrents/{session_id}/stream/{file_id}
@@ -288,48 +321,78 @@
         console.log("Fetching metadata from:", metadataUrl);
         
         try {
+          loadingStatus.status = "Reading video container...";
+          loadingStatus.phaseProgress = 40;
+          
           const response = await fetch(metadataUrl);
           if (response.ok) {
             const fetchedMetadata = await response.json();
             console.log("Fetched metadata:", fetchedMetadata);
             
-            // Set metadata
-            metadata = fetchedMetadata;
+            loadingStatus.status = "Processing track information...";
+            loadingStatus.phaseProgress = 60;
+            
+            // Preserve transcoded_audio_url from previous metadata if it exists
+            const existingTranscodedUrl = metadata?.transcoded_audio_url;
+            
+            // Set metadata (merge with existing to preserve transcoded_audio_url)
+            metadata = {
+              ...fetchedMetadata,
+              // Keep transcoded_audio_url if we already have it
+              transcoded_audio_url: existingTranscodedUrl || fetchedMetadata.transcoded_audio_url
+            };
             chapters = fetchedMetadata.chapters || [];
             
             console.log(`Found ${fetchedMetadata.audio_tracks.length} audio tracks`);
             console.log(`Found ${fetchedMetadata.subtitle_tracks.length} subtitle tracks`);
             console.log(`Found ${chapters.length} chapters`);
+            console.log(`Needs audio transcoding: ${fetchedMetadata.needs_audio_transcoding}`);
+            console.log(`Transcoded audio URL: ${metadata.transcoded_audio_url}`);
             
             // Initialize demuxer for subtitle extraction if there are subtitle tracks
             if (fetchedMetadata.subtitle_tracks.length > 0) {
+              loadingPhase = "demuxing";
+              loadingStatus.status = "Initializing subtitle demuxer...";
+              loadingStatus.phaseProgress = 70;
+              
               console.log("Initializing MKVDemuxer for subtitle extraction");
               try {
                 demuxer = new MKVDemuxer();
+                loadingStatus.status = "Loading demuxer...";
+                loadingStatus.phaseProgress = 80;
                 await demuxer.initialize(src);
+                loadingStatus.phaseProgress = 95;
                 console.log("MKVDemuxer initialized for subtitles");
               } catch (error) {
                 console.error("Failed to initialize MKVDemuxer:", error);
                 demuxer = null;
+                // Don't fail loading, just continue without subtitle demuxer
               }
             }
             
+            loadingPhase = "ready";
+            loadingStatus.status = "Ready to play";
+            loadingStatus.phaseProgress = 100;
             loading = false;
-            loadingStatus.status = "Ready";
+            // Now trigger autoplay after all loading is complete
+            startAutoplay();
           } else {
             console.error("Failed to fetch metadata:", response.status, response.statusText);
+            loadingPhase = "error";
+            loadingStatus.status = "Error: Failed to load video metadata";
             loading = false;
-            loadingStatus.status = "Error fetching metadata";
           }
         } catch (error) {
           console.error("Error fetching metadata:", error);
+          loadingPhase = "error";
+          loadingStatus.status = "Error: " + (error.message || "Failed to load metadata");
           loading = false;
-          loadingStatus.status = "Error fetching metadata";
         }
       } else {
         console.error("Could not parse session_id and file_id from URL:", src);
+        loadingPhase = "error";
+        loadingStatus.status = "Error: Invalid stream URL";
         loading = false;
-        loadingStatus.status = "Invalid stream URL";
       }
       
       // Use native video element for playback
@@ -344,13 +407,18 @@
     // For non-torrent sources, use native video element
     console.log("Using native video element playback");
     useMkvDemuxer = false;
+    loadingPhase = "ready";
+    loadingStatus.status = "Ready to play";
+    loadingStatus.phaseProgress = 100;
     loading = false;
-    loadingStatus.status = "Ready";
     
     // Unmute video element to use native audio
     if (videoElement) {
       videoElement.muted = false;
     }
+    
+    // Trigger autoplay for non-torrent sources
+    startAutoplay();
     
     // If native audioTracks API exists, build metadata from it
     if (hasNativeAudioTracks && videoElement.audioTracks && videoElement.audioTracks.length > 0) {
@@ -373,6 +441,195 @@
     }
   }
 
+  async function startAutoplay() {
+    // Wait a tick for loading overlay to hide
+    await new Promise(resolve => setTimeout(resolve, 50));
+    
+    if (videoElement) {
+      try {
+        // Check if we need to use transcoded audio
+        const hasTranscodedAudio = metadata?.transcoded_audio_url || metadata?.needs_audio_transcoding;
+        
+        console.log("=== startAutoplay ===");
+        console.log("metadata:", metadata);
+        console.log("transcoded_audio_url:", metadata?.transcoded_audio_url);
+        console.log("needs_audio_transcoding:", metadata?.needs_audio_transcoding);
+        
+        // Start muted to ensure autoplay works
+        const wasMuted = videoElement.muted;
+        videoElement.muted = true;
+        await videoElement.play();
+        console.log("Video started playing (muted)");
+        
+        // If we have transcoded audio, load it from disk via Tauri
+        if (hasTranscodedAudio && handleId !== null) {
+          console.log(">>> Setting up transcoded audio playback <<<");
+          
+          try {
+            // Check if we have cached transcoded audio first
+            const stableCacheId = getStableCacheId();
+            const TRANSCODED_TRACK_INDEX = 9999; // Special index for transcoded audio
+            
+            let audioBuffer = null;
+            let blobUrl = null;
+            
+            // Try to load from cache first
+            const cachedAudio = await loadCachedAudio(stableCacheId, fileIndex, TRANSCODED_TRACK_INDEX);
+            
+            if (cachedAudio) {
+              console.log(`[Transcoded Audio Cache] HIT - Loaded ${cachedAudio.length} bytes from disk`);
+              audioBuffer = cachedAudio;
+            } else {
+              // Load transcoded audio bytes directly from Tauri
+              console.log("[Transcoded Audio Cache] MISS - Loading from transcoder...");
+              console.log("  handleId:", handleId, "fileIndex:", fileIndex);
+              
+              const audioData = await invoke("load_transcoded_audio", {
+                sessionId: handleId,
+                fileIndex: fileIndex
+              });
+              
+              if (audioData) {
+                console.log(`Loaded ${audioData.length} bytes of transcoded audio from transcoder`);
+                audioBuffer = new Uint8Array(audioData);
+                
+                // Cache to disk for future use
+                console.log(`[Transcoded Audio Cache] STORE - Saving ${audioBuffer.length} bytes to disk`);
+                await saveCachedAudio(stableCacheId, fileIndex, TRANSCODED_TRACK_INDEX, audioBuffer);
+              }
+            }
+            
+            if (audioBuffer) {
+              // Create blob URL
+              const blob = new Blob([audioBuffer], { type: 'audio/aac' });
+              blobUrl = URL.createObjectURL(blob);
+              console.log("Created blob URL:", blobUrl);
+              
+              // Stop existing audio if any
+              if (audioPlayer && audioPlayer instanceof Audio) {
+                audioPlayer.pause();
+                audioPlayer.src = '';
+              }
+              
+              // Create new audio element
+              console.log("Creating new Audio element for transcoded audio");
+              audioPlayer = new Audio();
+              audioPlayer.preload = 'auto';
+              
+              // Set source and wait for it to be ready
+              audioPlayer.src = blobUrl;
+              
+              // Wait for audio to be ready before setting currentTime
+              await new Promise((resolve, reject) => {
+                const onCanPlay = () => {
+                  audioPlayer.removeEventListener('canplay', onCanPlay);
+                  audioPlayer.removeEventListener('error', onError);
+                  console.log("Audio element ready (canplay event)");
+                  resolve();
+                };
+                const onError = (e) => {
+                  audioPlayer.removeEventListener('canplay', onCanPlay);
+                  audioPlayer.removeEventListener('error', onError);
+                  console.error("Audio element error:", e);
+                  reject(new Error('Audio failed to load'));
+                };
+                audioPlayer.addEventListener('canplay', onCanPlay);
+                audioPlayer.addEventListener('error', onError);
+                
+                // Timeout after 10 seconds
+                setTimeout(() => {
+                  audioPlayer.removeEventListener('canplay', onCanPlay);
+                  audioPlayer.removeEventListener('error', onError);
+                  console.log("Audio canplay timeout - proceeding anyway");
+                  resolve();
+                }, 10000);
+              });
+              
+              // Now set volume and sync position
+              audioPlayer.volume = volume;
+              audioPlayer.muted = muted;
+              
+              // Keep video muted since we're using separate audio
+              videoElement.muted = true;
+              
+              // Sync to current video position
+              const syncTime = videoElement.currentTime;
+              console.log("Syncing audio to video time:", syncTime);
+              audioPlayer.currentTime = syncTime;
+              
+              // Start playing transcoded audio
+              console.log("Calling audioPlayer.play()...");
+              try {
+                await audioPlayer.play();
+                console.log("✓ Transcoded audio playback started successfully");
+                console.log("  audioPlayer.paused:", audioPlayer.paused);
+                console.log("  audioPlayer.currentTime:", audioPlayer.currentTime);
+                console.log("  audioPlayer.duration:", audioPlayer.duration);
+              } catch (playError) {
+                console.error("✗ audioPlayer.play() failed:", playError);
+                throw playError;
+              }
+              
+              // Mark that we're using transcoded audio (so syncing works)
+              selectedAudioTrack = 0; // Still track 0, but using transcoded version
+              needsAudioTranscoding = true; // Keep this flag for syncing logic
+            } else {
+              console.warn("No transcoded audio data available");
+              // Fall back to native audio
+              setTimeout(() => {
+                if (videoElement && !wasMuted) {
+                  videoElement.muted = false;
+                  console.log("Video unmuted (fallback - no data)");
+                }
+              }, 100);
+            }
+          } catch (audioErr) {
+            console.error("✗ Failed to setup transcoded audio:", audioErr);
+            // Fall back to native audio
+            setTimeout(() => {
+              if (videoElement && !wasMuted) {
+                videoElement.muted = false;
+                console.log("Video unmuted (error fallback)");
+              }
+            }, 100);
+          }
+        } else {
+          console.log("No transcoded audio - using native video audio");
+          // No transcoded audio - unmute video after play starts successfully
+          setTimeout(() => {
+            if (videoElement && !wasMuted) {
+              videoElement.muted = false;
+              console.log("Video unmuted");
+            }
+          }, 100);
+        }
+        
+        playing = true;
+        
+        // Add to watch history on autoplay
+        if (!hasAddedToHistory && mediaId && metadata && (metadata.title || metadata.name)) {
+          const episodeData = seasonNum !== null && episodeNum !== null ? {
+            season: seasonNum,
+            episode: episodeNum,
+            timestamp: Math.floor(currentTime),
+          } : null;
+          
+          const itemToSave = {
+            ...metadata,
+            id: mediaId,
+            media_type: mediaType
+          };
+          
+          console.log("Adding to watch history (autoplay):", itemToSave.title || itemToSave.name);
+          watchHistoryStore.addItem(itemToSave, episodeData);
+          hasAddedToHistory = true;
+        }
+      } catch (err) {
+        console.error("Autoplay failed:", err);
+      }
+    }
+  }
+
   async function close() {
     console.log("close/back button called");
     if (handleId !== null) {
@@ -387,12 +644,18 @@
 
   async function startStreamProcess() {
     loading = true;
+    loadingPhase = "initializing";
+    loadingStatus.status = "Preparing torrent...";
+    loadingStatus.phaseProgress = 0;
     try {
       await invoke("prepare_stream", { handleId, fileIndex });
+      loadingPhase = "buffering";
+      loadingStatus.status = "Connecting to peers...";
       pollInterval = setInterval(checkStreamStatus, 500);
     } catch (err) {
       console.error("Failed to prepare stream:", err);
       loadingStatus.status = "Error: " + err;
+      loadingPhase = "error";
     }
   }
 
@@ -401,66 +664,104 @@
       const status = await invoke("get_stream_status", { handleId, fileIndex });
       console.log("Stream status:", status);
 
+      // Determine status message based on state and progress
+      let statusMessage = "Connecting to peers...";
+      if (status.status === "transcoding" && status.transcode_progress !== null) {
+        loadingPhase = "transcoding";
+        statusMessage = "Transcoding audio...";
+      } else if (status.peers > 0) {
+        if (status.progress_bytes > 0 && status.total_bytes > 0) {
+          const percent = Math.round((status.progress_bytes / status.total_bytes) * 100);
+          const mbDownloaded = (status.progress_bytes / 1024 / 1024).toFixed(1);
+          const speedMbs = status.download_speed > 0 ? (status.download_speed / 1024 / 1024).toFixed(1) : 0;
+          statusMessage = `Buffering video... ${percent}% (${speedMbs} MB/s)`;
+        } else {
+          statusMessage = `Connected to ${status.peers} peer${status.peers > 1 ? 's' : ''}, waiting for data...`;
+        }
+      }
+
       loadingStatus = {
         progress: status.progress_bytes,
         total: status.total_bytes,
         speed: status.download_speed,
         peers: status.peers,
-        status: status.status,
+        status: statusMessage,
         state: status.state,
+        phaseProgress: status.status === "transcoding" 
+          ? (status.transcode_progress ?? 0)
+          : status.total_bytes > 0 ? Math.min((status.progress_bytes / status.total_bytes) * 100, 100) : 0,
+        transcodeProgress: status.transcode_progress,
       };
 
       if (status.status === "ready" && status.stream_info) {
+        // If we haven't checked metadata yet, fetch it now to see if transcoding is needed
+        if (!metadataFetched && !needsAudioTranscoding && status.stream_info.metadata === null) {
+          metadataFetched = true; // Only fetch once
+          // Metadata not in stream_info yet - fetch it from the metadata endpoint
+          const baseUrl = status.stream_info.url.substring(0, status.stream_info.url.indexOf('/torrents/'));
+          const urlMatch = status.stream_info.url.match(/\/torrents\/(\d+)\/stream\/(\d+)/);
+          if (urlMatch) {
+            const sessionId = urlMatch[1];
+            const fileId = urlMatch[2];
+            const metadataUrl = `${baseUrl}/torrents/${sessionId}/metadata/${fileId}`;
+            
+            console.log("Fetching metadata to check if transcoding is needed:", metadataUrl);
+            try {
+              const response = await fetch(metadataUrl);
+              if (response.ok) {
+                const fetchedMetadata = await response.json();
+                console.log("Fetched metadata:", fetchedMetadata);
+                console.log("needs_audio_transcoding:", fetchedMetadata.needs_audio_transcoding);
+                
+                if (fetchedMetadata.needs_audio_transcoding) {
+                  needsAudioTranscoding = true;
+                  console.log("Audio transcoding is required, will wait for completion");
+                }
+              }
+            } catch (err) {
+              console.error("Error fetching metadata:", err);
+            }
+          }
+        }
+        
+        // Check if transcoding is still needed but not complete
+        // Use the metadata from stream_info, OR the tracked needsAudioTranscoding flag
+        const metadataTranscoding = status.stream_info.metadata?.needs_audio_transcoding;
+        const hasTranscodedUrl = status.stream_info.metadata?.transcoded_audio_url;
+        
+        // If metadata says transcoding needed, remember this
+        if (metadataTranscoding === true) {
+          needsAudioTranscoding = true;
+        }
+        
+        // If we know transcoding is needed (from metadata or previous check) and we don't have the transcoded URL
+        if (needsAudioTranscoding && !hasTranscodedUrl) {
+          // Still waiting for transcoding, don't proceed yet
+          console.log("Transcoding needed but not complete, continuing to poll...");
+          console.log("  needsAudioTranscoding:", needsAudioTranscoding);
+          console.log("  hasTranscodedUrl:", hasTranscodedUrl);
+          console.log("  transcode_progress:", status.transcode_progress);
+          loadingPhase = "transcoding";
+          loadingStatus.status = status.transcode_progress !== null && status.transcode_progress !== undefined
+            ? "Transcoding audio..."
+            : "Waiting for download to complete for transcoding...";
+          loadingStatus.phaseProgress = status.transcode_progress ?? 0;
+          loadingStatus.transcodeProgress = status.transcode_progress;
+          return; // Keep polling
+        }
+        
         clearInterval(pollInterval);
+        loadingPhase = "metadata";
+        loadingStatus.status = "Loading video metadata...";
+        loadingStatus.phaseProgress = 0;
         src = status.stream_info.url;
         // Merge metadata if provided
         if (status.stream_info.metadata) {
+          console.log("Setting metadata from stream_info:", status.stream_info.metadata);
+          console.log("  transcoded_audio_url:", status.stream_info.metadata.transcoded_audio_url);
           metadata = status.stream_info.metadata;
         }
-        // Don't set loading to false yet - demuxer initialization will handle it
-        // Auto play - start muted to bypass autoplay restrictions, then unmute
-        setTimeout(async () => {
-          if (videoElement) {
-            try {
-              // Start muted to ensure autoplay works (only for non-demuxer)
-              const wasMuted = videoElement.muted;
-              if (!useMkvDemuxer) {
-                videoElement.muted = true;
-              }
-              await videoElement.play();
-              // Unmute after play starts successfully (only if wasn't originally muted and not using demuxer)
-              setTimeout(() => {
-                if (videoElement && !wasMuted && !useMkvDemuxer) {
-                  videoElement.muted = false;
-                }
-              }, 100);
-              playing = true;
-              
-              // Add to watch history on autoplay (only if metadata is valid)
-              if (!hasAddedToHistory && mediaId && metadata && (metadata.title || metadata.name)) {
-                const episodeData = seasonNum !== null && episodeNum !== null ? {
-                  season: seasonNum,
-                  episode: episodeNum,
-                  timestamp: Math.floor(currentTime),
-                } : null;
-                
-                // Ensure metadata has correct id and media_type
-                const itemToSave = {
-                  ...metadata,
-                  id: mediaId,
-                  media_type: mediaType
-                };
-                
-                console.log("Adding to watch history (autoplay):", itemToSave.title || itemToSave.name, "ID:", mediaId, "Type:", mediaType, episodeData);
-                watchHistoryStore.addItem(itemToSave, episodeData);
-                hasAddedToHistory = true;
-              }
-            } catch (err) {
-              console.error("Autoplay failed:", err);
-              // If autoplay fails, user will need to click play
-            }
-          }
-        }, 100);
+        // Don't autoplay here - wait for loading to complete in initializeDemuxer
       }
     } catch (err) {
       console.error("Error checking status:", err);
@@ -469,18 +770,20 @@
 
   function togglePlay() {
     console.log("togglePlay called");
+    const usingTranscodedAudio = needsAudioTranscoding && audioPlayer instanceof Audio;
+    
     if (playing) {
       videoElement.pause();
-      // Pause extracted audio if active (HTML5 Audio)
-      if (selectedAudioTrack > 0 && audioPlayer && audioPlayer instanceof Audio) {
+      // Pause extracted/transcoded audio if active (HTML5 Audio)
+      if ((selectedAudioTrack > 0 || usingTranscodedAudio) && audioPlayer && audioPlayer instanceof Audio) {
         audioPlayer.pause();
       }
       playing = false;
     } else {
       if (videoElement.paused) {
         videoElement.play();
-        // Play extracted audio if active (HTML5 Audio)
-        if (selectedAudioTrack > 0 && audioPlayer && audioPlayer instanceof Audio) {
+        // Play extracted/transcoded audio if active (HTML5 Audio)
+        if ((selectedAudioTrack > 0 || usingTranscodedAudio) && audioPlayer && audioPlayer instanceof Audio) {
           audioPlayer.play();
         }
         playing = true;
@@ -541,8 +844,9 @@
           if (audioPlayer) audioPlayer.seek(seekPreviewTime);
         }
         
-        // Sync HTML5 Audio when using extracted audio (track > 0)
-        if (selectedAudioTrack > 0 && audioPlayer && audioPlayer instanceof Audio) {
+        // Sync HTML5 Audio when using extracted audio (track > 0) OR transcoded audio
+        const usingTranscodedAudio = needsAudioTranscoding && audioPlayer instanceof Audio;
+        if ((selectedAudioTrack > 0 || usingTranscodedAudio) && audioPlayer && audioPlayer instanceof Audio) {
           audioPlayer.currentTime = seekPreviewTime;
         }
         
@@ -603,8 +907,9 @@
     if (videoElement && isFinite(seekTime)) {
       videoElement.currentTime = seekTime;
 
-      // Sync HTML5 Audio when using extracted audio (track > 0)
-      if (selectedAudioTrack > 0 && audioPlayer && audioPlayer instanceof Audio) {
+      // Sync HTML5 Audio when using extracted audio (track > 0) or transcoded audio
+      const usingTranscodedAudio = needsAudioTranscoding && audioPlayer instanceof Audio;
+      if ((selectedAudioTrack > 0 || usingTranscodedAudio) && audioPlayer && audioPlayer instanceof Audio) {
         audioPlayer.currentTime = seekTime;
       }
       
@@ -712,8 +1017,9 @@
       buffered = videoElement.buffered.end(videoElement.buffered.length - 1);
     }
     
-    // Sync HTML5 Audio playback with video (for extracted audio tracks)
-    if (selectedAudioTrack > 0 && audioPlayer && audioPlayer instanceof Audio && playing) {
+    // Sync HTML5 Audio playback with video (for extracted/transcoded audio tracks)
+    const usingTranscodedAudio = needsAudioTranscoding && audioPlayer instanceof Audio;
+    if ((selectedAudioTrack > 0 || usingTranscodedAudio) && audioPlayer && audioPlayer instanceof Audio && playing) {
       const drift = Math.abs(audioPlayer.currentTime - videoElement.currentTime);
       // Resync if drift exceeds 200ms
       if (drift > 0.2) {
@@ -1175,15 +1481,12 @@
           }
           
           // Use SubtitlesOctopus for ASS/SSA
-          if (!subtitleRenderer && videoElement) {
-            subtitleRenderer = new SubtitleRenderer(null, videoElement);
-            await subtitleRenderer.initialize();
-          }
-          
+          // Create renderer if not exists, or use existing one (it will reinitialize internally)
           if (!subtitleRenderer) {
-            throw new Error('Failed to initialize subtitle renderer');
+            subtitleRenderer = new SubtitleRenderer(null, videoElement);
           }
           
+          // loadSubtitleTrack will reinitialize the octopus instance for proper track switching
           await subtitleRenderer.loadSubtitleTrack(subtitleData, codec);
           subtitleRenderer.show();
           
@@ -1466,10 +1769,70 @@
   {#if loading}
     <div class="loading-overlay">
       <div class="loading-content">
-        <div class="spinner"></div>
+        <!-- Phase indicator -->
+        <div class="loading-phases">
+          <div class="loading-phase" class:active={loadingPhase === 'initializing'} class:complete={['buffering', 'metadata', 'transcoding', 'demuxing', 'ready'].includes(loadingPhase)}>
+            <div class="phase-icon">
+              {#if ['buffering', 'metadata', 'transcoding', 'demuxing', 'ready'].includes(loadingPhase)}
+                <i class="ri-check-line"></i>
+              {:else}
+                <span>1</span>
+              {/if}
+            </div>
+            <span class="phase-label">Initialize</span>
+          </div>
+          <div class="phase-connector" class:complete={['buffering', 'metadata', 'transcoding', 'demuxing', 'ready'].includes(loadingPhase)}></div>
+          <div class="loading-phase" class:active={loadingPhase === 'buffering'} class:complete={['metadata', 'transcoding', 'demuxing', 'ready'].includes(loadingPhase)}>
+            <div class="phase-icon">
+              {#if ['metadata', 'transcoding', 'demuxing', 'ready'].includes(loadingPhase)}
+                <i class="ri-check-line"></i>
+              {:else}
+                <span>2</span>
+              {/if}
+            </div>
+            <span class="phase-label">Buffer</span>
+          </div>
+          <div class="phase-connector" class:complete={['metadata', 'transcoding', 'demuxing', 'ready'].includes(loadingPhase)}></div>
+          <div class="loading-phase" class:active={loadingPhase === 'metadata'} class:complete={['transcoding', 'demuxing', 'ready'].includes(loadingPhase)}>
+            <div class="phase-icon">
+              {#if ['transcoding', 'demuxing', 'ready'].includes(loadingPhase)}
+                <i class="ri-check-line"></i>
+              {:else}
+                <span>3</span>
+              {/if}
+            </div>
+            <span class="phase-label">Metadata</span>
+          </div>
+          <div class="phase-connector" class:complete={['transcoding', 'demuxing', 'ready'].includes(loadingPhase)}></div>
+          <div class="loading-phase" class:active={loadingPhase === 'transcoding'} class:complete={['demuxing', 'ready'].includes(loadingPhase)}>
+            <div class="phase-icon">
+              {#if ['demuxing', 'ready'].includes(loadingPhase)}
+                <i class="ri-check-line"></i>
+              {:else}
+                <span>4</span>
+              {/if}
+            </div>
+            <span class="phase-label">Transcode</span>
+          </div>
+          <div class="phase-connector" class:complete={['demuxing', 'ready'].includes(loadingPhase)}></div>
+          <div class="loading-phase" class:active={loadingPhase === 'demuxing'} class:complete={loadingPhase === 'ready'}>
+            <div class="phase-icon">
+              {#if loadingPhase === 'ready'}
+                <i class="ri-check-line"></i>
+              {:else}
+                <span>5</span>
+              {/if}
+            </div>
+            <span class="phase-label">Prepare</span>
+          </div>
+        </div>
+
         <div class="loading-status">{loadingStatus.status}</div>
-        {#if loadingStatus.total > 0}
-          <div class="loading-progress">
+        
+        <!-- Progress bar -->
+        <div class="loading-progress">
+          {#if loadingPhase === 'buffering' && loadingStatus.total > 0}
+            <!-- Determinate progress bar for buffering with actual progress -->
             <div class="progress-bar-loading">
               <div 
                 class="progress-fill"
@@ -1478,14 +1841,43 @@
             </div>
             <div class="loading-stats">
               <span>{(loadingStatus.progress / 1024 / 1024).toFixed(1)} MB / {(loadingStatus.total / 1024 / 1024).toFixed(1)} MB</span>
+              {#if loadingStatus.speed > 0}
+                <span class="speed-stat">{(loadingStatus.speed / 1024 / 1024).toFixed(1)} MB/s</span>
+              {/if}
             </div>
-          </div>
-        {:else}
-          <div class="loading-stats">
-            <span>{loadingStatus.peers} peers</span>
+          {:else if loadingPhase === 'transcoding' && loadingStatus.transcodeProgress !== undefined}
+            <!-- Determinate progress bar for transcoding -->
+            <div class="progress-bar-loading">
+              <div 
+                class="progress-fill"
+                style="width: {loadingStatus.transcodeProgress}%"
+              ></div>
+            </div>
+            <div class="loading-stats">
+              <span>{loadingStatus.transcodeProgress.toFixed(0)}% complete</span>
+            </div>
+          {:else}
+            <!-- Indeterminate progress bar for other phases -->
+            <div class="progress-bar-loading indeterminate">
+              <div class="progress-fill-indeterminate"></div>
+            </div>
+          {/if}
+        </div>
+        
+        <!-- Peer count only during buffering with actual progress -->
+        {#if loadingPhase === 'buffering' && loadingStatus.total > 0 && loadingStatus.peers > 0}
+          <div class="loading-stats peer-stats">
+            <span class="peer-stat">
+              <i class="ri-group-line"></i>
+              {loadingStatus.peers} peer{loadingStatus.peers !== 1 ? 's' : ''}
+            </span>
           </div>
         {/if}
-        <button class="cancel-loading-btn" on:click={close}>Cancel</button>
+        
+        <button class="cancel-loading-btn" on:click={close}>
+          <i class="ri-close-line"></i>
+          Cancel
+        </button>
       </div>
     </div>
   {/if}

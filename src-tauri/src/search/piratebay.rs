@@ -1,7 +1,6 @@
 use super::{SearchProvider, SearchResult, parse_audio_codec};
 use async_trait::async_trait;
 use reqwest::Client;
-use scraper::{Html, Selector};
 use std::error::Error;
 use regex::Regex;
 
@@ -19,7 +18,7 @@ impl PirateBayProvider {
         Self {
             client: Client::builder()
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap(),
             season_regex: Regex::new(r"(?i)S(\d{1,2})|Season\s*(\d{1,2})").unwrap(),
@@ -55,123 +54,146 @@ impl PirateBayProvider {
 
         (season, episode, quality, encode, is_batch)
     }
+    
+    /// Search with optional IMDB ID for prioritization
+    /// Results matching the IMDB ID will be boosted to the top
+    pub async fn search_with_imdb(&self, query: &str, target_imdb: Option<&str>) -> Result<Vec<SearchResult>, Box<dyn Error + Send + Sync>> {
+        let mut results = Vec::new();
+        let encoded_query = urlencoding::encode(query);
+        
+        // Use apibay.org API - cat=200 is video category
+        let api_url = format!("https://apibay.org/q.php?q={}&cat=200", encoded_query);
+        
+        println!("TPB: Trying API at {}", api_url);
+        
+        // Normalize target IMDB (strip "tt" prefix if present)
+        let normalized_target_imdb = target_imdb.map(|id| {
+            id.trim_start_matches("tt").to_string()
+        });
+        
+        match self.client.get(&api_url).send().await {
+            Ok(response) => {
+                println!("TPB API: Got response, status: {}", response.status());
+                if let Ok(text) = response.text().await {
+                    println!("TPB API: Got response, length: {}", text.len());
+                    // Parse JSON array of torrents
+                    if let Ok(torrents) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                        for torrent in torrents {
+                            // Skip "No results" placeholder
+                            if torrent.get("id").and_then(|v| v.as_str()) == Some("0") {
+                                continue;
+                            }
+                            
+                            let name = torrent.get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            
+                            if name.is_empty() || name == "No results returned" {
+                                continue;
+                            }
+                            
+                            let info_hash = torrent.get("info_hash")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            
+                            if info_hash.is_empty() {
+                                continue;
+                            }
+                            
+                            // Get IMDB from result (strip "tt" prefix for comparison)
+                            let result_imdb = torrent.get("imdb")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.trim_start_matches("tt").to_string())
+                                .filter(|s| !s.is_empty());
+                            
+                            // Check if this result matches target IMDB
+                            let matches_imdb = match (&normalized_target_imdb, &result_imdb) {
+                                (Some(target), Some(result)) => target == result,
+                                _ => false,
+                            };
+                            
+                            // Build magnet link
+                            let magnet_link = format!(
+                                "magnet:?xt=urn:btih:{}&dn={}",
+                                info_hash,
+                                urlencoding::encode(&name)
+                            );
+                            
+                            let size_bytes: u64 = torrent.get("size")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            
+                            let size = if size_bytes >= 1_073_741_824 {
+                                format!("{:.2} GiB", size_bytes as f64 / 1_073_741_824.0)
+                            } else if size_bytes >= 1_048_576 {
+                                format!("{:.2} MiB", size_bytes as f64 / 1_048_576.0)
+                            } else if size_bytes >= 1024 {
+                                format!("{:.2} KiB", size_bytes as f64 / 1024.0)
+                            } else {
+                                format!("{} B", size_bytes)
+                            };
+                            
+                            let seeds: u32 = torrent.get("seeders")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            
+                            let peers: u32 = torrent.get("leechers")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            
+                            let (season, episode, quality, encode, is_batch) = self.parse_metadata(&name);
+                            let audio_codec = parse_audio_codec(&name);
 
-    fn parse_size(&self, size_str: &str) -> String {
-        // TPB uses format like "1.5 GiB" or "700 MiB"
-        let parts: Vec<&str> = size_str.split_whitespace().collect();
-        if parts.len() >= 2 {
-            format!("{} {}", parts[0], parts[1])
-        } else {
-            "Unknown".to_string()
+                            results.push((matches_imdb, SearchResult {
+                                title: name,
+                                size,
+                                seeds,
+                                peers,
+                                magnet_link,
+                                provider: "ThePirateBay".to_string(),
+                                season,
+                                episode,
+                                quality,
+                                encode,
+                                is_batch,
+                                audio_codec,
+                            }));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                println!("TPB API: Error fetching: {}", e);
+            }
         }
+
+        // Sort: IMDB matches first, then by seeds descending
+        results.sort_by(|a, b| {
+            // First compare by IMDB match (matches come first)
+            match (a.0, b.0) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                // If same match status, sort by seeds
+                _ => b.1.seeds.cmp(&a.1.seeds),
+            }
+        });
+        
+        // Extract just the SearchResults
+        let final_results: Vec<SearchResult> = results.into_iter().map(|(_, r)| r).collect();
+        
+        println!("TPB: Returning {} results", final_results.len());
+        Ok(final_results)
     }
 }
 
 #[async_trait]
 impl SearchProvider for PirateBayProvider {
     async fn search(&self, query: &str) -> Result<Vec<SearchResult>, Box<dyn Error + Send + Sync>> {
-        let mut results = Vec::new();
-
-        // Try multiple TPB mirrors
-        let mirrors = vec![
-            "https://thepiratebay10.org",
-            "https://thepiratebay0.org",
-            "https://tpb.party",
-        ];
-
-        for mirror in mirrors {
-            println!("TPB: Trying mirror {}", mirror);
-            // Fetch 3 pages for more results
-            for page in 0..3 {
-                let url = format!("{}/search/{}/{}/7/0", mirror, query.replace(" ", "%20"), page);
-                println!("TPB: Fetching {}", url);
-            
-                match self.client.get(&url).send().await {
-                    Ok(response) => {
-                        println!("TPB: Got response, status: {}", response.status());
-                        if let Ok(html) = response.text().await {
-                            println!("TPB: Got HTML, length: {}", html.len());
-                            let document = Html::parse_document(&html);
-                            let row_selector = Selector::parse("#searchResult tbody tr").unwrap();
-                            let row_count = document.select(&row_selector).count();
-                            println!("TPB: Found {} rows", row_count);
-                            let name_selector = Selector::parse("td:nth-child(2) a.detLink").unwrap();
-                            let magnet_selector = Selector::parse("td:nth-child(2) a[href^='magnet:']").unwrap();
-                            let info_selector = Selector::parse("td:nth-child(2) font.detDesc").unwrap();
-                            let seeds_selector = Selector::parse("td:nth-child(3)").unwrap();
-                            let peers_selector = Selector::parse("td:nth-child(4)").unwrap();
-
-                            for row in document.select(&row_selector) {
-                                let name = match row.select(&name_selector).next() {
-                                    Some(el) => el.text().collect::<String>().trim().to_string(),
-                                    None => continue,
-                                };
-
-                                let magnet_link = match row.select(&magnet_selector).next() {
-                                    Some(el) => match el.value().attr("href") {
-                                        Some(href) => href.to_string(),
-                                        None => continue,
-                                    },
-                                    None => continue,
-                                };
-
-                                let size = match row.select(&info_selector).next() {
-                                    Some(el) => {
-                                        let text = el.text().collect::<String>();
-                                        if let Some(size_idx) = text.find("Size") {
-                                            let size_part = &text[size_idx..];
-                                            if let Some(comma_idx) = size_part.find(',') {
-                                                let size_str = &size_part[5..comma_idx].trim();
-                                                self.parse_size(size_str)
-                                            } else {
-                                                "Unknown".to_string()
-                                            }
-                                        } else {
-                                            "Unknown".to_string()
-                                        }
-                                    },
-                                    None => "Unknown".to_string(),
-                                };
-
-                                let seeds = match row.select(&seeds_selector).next() {
-                                    Some(el) => el.text().collect::<String>().trim().parse().unwrap_or(0),
-                                    None => 0,
-                                };
-
-                                let peers = match row.select(&peers_selector).next() {
-                                    Some(el) => el.text().collect::<String>().trim().parse().unwrap_or(0),
-                                    None => 0,
-                                };
-
-                                let (season, episode, quality, encode, is_batch) = self.parse_metadata(&name);
-                                let audio_codec = parse_audio_codec(&name);
-
-                                results.push(SearchResult {
-                                    title: name,
-                                    size,
-                                    seeds,
-                                    peers,
-                                    magnet_link,
-                                    provider: "ThePirateBay".to_string(),
-                                    season,
-                                    episode,
-                                    quality,
-                                    encode,
-                                    is_batch,
-                                    audio_codec,
-                                });
-                            }
-                        }
-                    }
-                    Err(_) => continue, // Try next page or mirror
-                }
-            }
-            
-            if !results.is_empty() {
-                break; // Got results, stop trying mirrors
-            }
-        }
-
-        Ok(results)
+        // Default search without IMDB prioritization
+        self.search_with_imdb(query, None).await
     }
 }

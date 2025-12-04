@@ -14,6 +14,10 @@ let textColor = '#ffffff';
 let isTransitioning = false;
 let slideDirection = 'right';
 
+// Backdrop crossfade management - use array to keep both images in DOM
+let backdropImages = []; // Array of {url, id, visible}
+let backdropIdCounter = 0;
+
 $: myList = $myListStore;
 $: myListItems = new Set(myList.map(item => `${item.id}-${item.media_type}`));
 $: {
@@ -25,7 +29,24 @@ $: {
 
 $: currentItem = displayedRecommendations[currentIndex];
 
+// Update backdrop with crossfade when currentItem changes
 $: if (currentItem?.backdrop_path) {
+  const newUrl = getImageUrl(currentItem.backdrop_path, 'original');
+  // Check if this URL is already the latest in the array
+  const latestImg = backdropImages[backdropImages.length - 1];
+  if (!latestImg || latestImg.url !== newUrl) {
+    // Mark all existing images as not visible (fading out)
+    backdropImages = backdropImages.map(img => ({ ...img, visible: false }));
+    // Add new image
+    backdropIdCounter++;
+    backdropImages = [...backdropImages, { url: newUrl, id: backdropIdCounter, visible: false, loaded: false }];
+    // Clean up old images after transition (keep max 2)
+    setTimeout(() => {
+      if (backdropImages.length > 2) {
+        backdropImages = backdropImages.slice(-2);
+      }
+    }, 700);
+  }
   extractColors(currentItem.backdrop_path);
 }
 
@@ -264,11 +285,20 @@ function getGenres(item) {
   </div>
 {:else if !loading && displayedRecommendations.length > 0 && currentItem}
   <div class="recommendations-featured" style="--backdrop-color: {backdropColor}; --prominent-color: {prominentColor}; --text-color: {textColor}">
-    <div class="featured-backdrop" class:loaded={!isTransitioning}>
-      {#each [currentItem] as item (item.id)}
-        {#if item.backdrop_path}
-          <img src={getImageUrl(item.backdrop_path, 'original')} alt={item.title || item.name} on:load={() => isTransitioning && setTimeout(() => isTransitioning = false, 0)} />
-        {/if}
+    <div class="featured-backdrop">
+      {#each backdropImages as img (img.id)}
+        <img 
+          src={img.url} 
+          alt=""
+          class="backdrop-img" 
+          class:visible={img.visible}
+          on:load={() => {
+            // Mark this image as loaded and visible
+            backdropImages = backdropImages.map(i => 
+              i.id === img.id ? { ...i, loaded: true, visible: true } : i
+            );
+          }} 
+        />
       {/each}
     </div>
 
@@ -278,14 +308,14 @@ function getGenres(item) {
     
     <div class="featured-content">
       {#key currentItem.id}
-      <div class="featured-header" style="animation: {slideDirection === 'right' ? 'fadeSlideRight' : 'fadeSlideLeft'} 0.4s ease;">
-        <div class="detail-poster">
+      <div class="featured-header">
+        <div class="detail-poster" style="animation: {slideDirection === 'right' ? 'fadeCardSlide3dRight' : 'fadeCardSlide3dLeft'} 0.5s ease; transform-style: preserve-3d;">
           {#if currentItem.poster_path}
             <img src={getImageUrl(currentItem.poster_path, 'w500')} alt={currentItem.title || currentItem.name} />
           {/if}
         </div>
 
-        <div class="detail-info-wrapper">
+        <div class="detail-info-wrapper" style="animation: {slideDirection === 'right' ? 'fadeSlide3dRight' : 'fadeSlide3dLeft'} 0.5s ease; transform-style: preserve-3d;">
           <div class="detail-info">
               <h1 class="detail-title">{currentItem.title || currentItem.name}</h1>
 
