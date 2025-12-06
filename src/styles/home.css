@@ -714,37 +714,3 @@
         transform: translateX(0) rotateY(0deg) scale(1);
     }
 }
-
-@media (max-width: 1024px) {
-    .recommendations-featured {
-        min-height: clamp(350px, 45vh, 500px);
-        max-height: clamp(350px, 45vh, 500px);
-    }
-
-    .featured-content {
-        min-height: clamp(350px, 45vh, 500px);
-        max-height: clamp(350px, 55vh, 500px);
-    }
-}
-
-@media (max-height: 700px) {
-    .recommendations-featured {
-        min-height: 400px;
-        max-height: 400px;
-    }
-
-    .featured-content {
-        min-height: 400px;
-        max-height: 400px;
-        padding: var(--spacing-md) var(--spacing-xl) var(--spacing-md);
-    }
-
-    .featured-header {
-        padding-bottom: var(--spacing-sm);
-        margin-bottom: 0;
-    }
-
-    .recommendations-nav {
-        padding: var(--spacing-sm) var(--spacing-xl);
-    }
-}

@@ -13,6 +13,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
   let searchActive = false;
+  let settingsActive = false;
   let selectedMedia = null;
   let viewAllData = null;
   let titleBarAccentColor = null;
@@ -51,9 +52,22 @@
 
     window.addEventListener("openVideoPlayer", (e) => {
       console.log("Opening video player with:", e.detail);
-      videoPlayerProps = e.detail;
-      showVideoPlayer = true;
-      videoControlsVisible = true;
+      
+      // If video player is already open, close it first to force remount
+      if (showVideoPlayer) {
+        showVideoPlayer = false;
+        videoPlayerProps = null;
+        // Wait for next tick to ensure component is unmounted
+        setTimeout(() => {
+          videoPlayerProps = e.detail;
+          showVideoPlayer = true;
+          videoControlsVisible = true;
+        }, 50);
+      } else {
+        videoPlayerProps = e.detail;
+        showVideoPlayer = true;
+        videoControlsVisible = true;
+      }
     });
 
     window.addEventListener("videoControlsVisibility", (e) => {
@@ -213,6 +227,7 @@
   <div class="titlebar-wrapper" class:hidden={showVideoPlayer && !videoControlsVisible}>
     <TitleBar 
       bind:searchActive 
+      bind:settingsActive
       accentColor={showVideoPlayer ? null : titleBarAccentColor} 
       immersive={showVideoPlayer}
     />
@@ -221,7 +236,7 @@
     <VideoPlayer {...videoPlayerProps} on:close={closeVideoPlayer} on:back={backFromVideoPlayer} />
   {:else}
 
-    <div class="content-scroll" id="main-content" class:blur={searchActive}>
+    <div class="content-scroll" id="main-content" class:blur={searchActive || settingsActive}>
       {#if selectedMedia}
         <MediaDetail media={selectedMedia} on:close={navigateBack} />
       {:else if viewAllData}
@@ -246,7 +261,7 @@
               showClearButton={true}
               hideViewAll={true}
               isRecentlyWatched={true}
-              {watchProgress}
+              watchProgress={$watchProgressStore}
               on:clear={() => watchHistoryStore.clear()}
               on:removeItem={(e) => {
                 watchHistoryStore.removeItem(e.detail.id, e.detail.media_type);

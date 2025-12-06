@@ -210,7 +210,20 @@ function openDetail(item) {
   if (!item.media_type) {
     item.media_type = type === 'tv' ? 'tv' : 'movie';
   }
-  window.dispatchEvent(new CustomEvent('openMediaDetail', { detail: item }));
+  
+  // When opening detail (not quick play), strip episode tracking info
+  // so it doesn't auto-navigate to a specific episode
+  const cleanItem = { ...item };
+  delete cleanItem.current_season;
+  delete cleanItem.current_episode;
+  delete cleanItem.current_timestamp;
+  delete cleanItem.currentSeason;
+  delete cleanItem.currentEpisode;
+  delete cleanItem.currentTimestamp;
+  delete cleanItem.watched_at;
+  delete cleanItem.watchedAt;
+  
+  window.dispatchEvent(new CustomEvent('openMediaDetail', { detail: cleanItem }));
 }
 
 function isInMyList(item) {
@@ -247,21 +260,26 @@ function handleRemoveFromHistory(event, item) {
 }
 
 function getProgressInfo(item) {
-  // For recently watched, progress info is stored directly on the item
-  // (added by watchHistoryStore.addItem)
-  const progress = item.currentSeason ? item : (watchProgress[`${item.id}-${item.media_type}`] || null);
+  // Check watchProgress prop first, then fall back to item data
+  const key = `${item.id}-${item.media_type}`;
+  const progress = watchProgress?.[key] || (item.current_season || item.currentSeason ? item : null);
   
   if (!progress) return null;
   
+  // Handle both snake_case (from Rust) and camelCase (from JS)
+  const season = progress.current_season || progress.currentSeason;
+  const episode = progress.current_episode || progress.currentEpisode;
+  const timestamp = progress.current_timestamp || progress.currentTimestamp;
+  
   // For TV shows, show episode
-  if ((item.media_type === 'tv' || item.first_air_date) && progress.currentSeason && progress.currentEpisode) {
-    const s = progress.currentSeason.toString().padStart(2, '0');
-    const e = progress.currentEpisode.toString().padStart(2, '0');
+  if ((item.media_type === 'tv' || item.first_air_date) && season && episode) {
+    const s = season.toString().padStart(2, '0');
+    const e = episode.toString().padStart(2, '0');
     
     // If there's also a timestamp, show it too
-    if (progress.currentTimestamp && progress.currentTimestamp > 60) {
-      const minutes = Math.floor(progress.currentTimestamp / 60);
-      const seconds = progress.currentTimestamp % 60;
+    if (timestamp && timestamp > 60) {
+      const minutes = Math.floor(timestamp / 60);
+      const seconds = Math.floor(timestamp % 60);
       return `S${s}E${e} · ${minutes}:${seconds.toString().padStart(2, '0')}`;
     }
     
@@ -269,9 +287,9 @@ function getProgressInfo(item) {
   }
   
   // For movies, show timestamp
-  if (progress.currentTimestamp && progress.currentTimestamp > 60) {
-    const totalMinutes = Math.floor(progress.currentTimestamp / 60);
-    const seconds = progress.currentTimestamp % 60;
+  if (timestamp && timestamp > 60) {
+    const totalMinutes = Math.floor(timestamp / 60);
+    const seconds = Math.floor(timestamp % 60);
     const hours = Math.floor(totalMinutes / 60);
     const minutes = totalMinutes % 60;
     
@@ -282,6 +300,16 @@ function getProgressInfo(item) {
   }
   
   return null;
+}
+
+function getProgressPercentage(item) {
+  const key = `${item.id}-${item.media_type}`;
+  const timestamp = item.current_timestamp || item.currentTimestamp;
+  const progress = watchProgress?.[key] || (timestamp ? item : null);
+  
+  if (!progress || !progress.currentTimestamp || !progress.duration) return 0;
+  
+  return Math.min(100, Math.max(0, (progress.currentTimestamp / progress.duration) * 100));
 }
 
 function handleViewAll() {

@@ -40,7 +40,9 @@ chrono = "0.4"
 urlencoding = "2.1"
 sha2 = "0.10"
 base64 = "0.22"
+md5 = "0.7"
 ffmpeg-sidecar = "2.3.0"
+dirs = "5.0"
 
 
 [features]

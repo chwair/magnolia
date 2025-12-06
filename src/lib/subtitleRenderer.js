@@ -4,6 +4,12 @@ export class SubtitleRenderer {
   constructor(canvas, videoElement) {
     this.videoElement = videoElement;
     this.octopus = null;
+    this.customFonts = [];
+  }
+
+  setFonts(fontPaths) {
+    this.customFonts = fontPaths || [];
+    console.log('[SubtitleRenderer] Set custom fonts:', this.customFonts);
   }
 
   async initialize() {
@@ -18,10 +24,16 @@ export class SubtitleRenderer {
     // Dispose of any existing instance first
     this.dispose();
 
+    const fontList = this.customFonts.length > 0 
+      ? this.customFonts 
+      : ['/fonts/geist-sans.woff2', '/fonts/.fallback-default.woff2'];
+    
+    console.log('[SubtitleRenderer] Initializing with fonts:', fontList);
+    
     this.octopus = new SubtitlesOctopus({
       video: this.videoElement,
       subContent: '[Script Info]\nTitle: Default\n\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n',
-      fonts: ['/fonts/geist-sans.woff2', '/fonts/.fallback-default.woff2'],
+      fonts: fontList,
       workerUrl: '/subtitles-octopus-worker.js',
       legacyWorkerUrl: '/subtitles-octopus-worker-legacy.js',
     });
@@ -53,10 +65,16 @@ export class SubtitleRenderer {
       throw new Error('Video element must be in DOM');
     }
 
+    const fontList = this.customFonts.length > 0 
+      ? this.customFonts 
+      : ['/fonts/geist-sans.woff2', '/fonts/.fallback-default.woff2'];
+    
+    console.log('[SubtitleRenderer] Loading track with fonts:', fontList);
+    
     this.octopus = new SubtitlesOctopus({
       video: this.videoElement,
       subContent: subtitleData,
-      fonts: ['/fonts/geist-sans.woff2', '/fonts/.fallback-default.woff2'],
+      fonts: fontList,
       workerUrl: '/subtitles-octopus-worker.js',
       legacyWorkerUrl: '/subtitles-octopus-worker-legacy.js',
     });
@@ -95,5 +113,10 @@ export class SubtitleRenderer {
 
   getCanvas() {
     return this.octopus?.canvas || null;
+  }
+
+  updateTime(time) {
+    // SubtitlesOctopus handles time updates automatically via the video element
+    // This method exists for compatibility but does nothing
   }
 }

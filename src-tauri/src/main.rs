@@ -7,6 +7,10 @@ mod torrent;
 mod tracking;
 mod dash;
 mod media_cache;
+mod font_manager;
+mod watch_history;
+mod track_preferences;
+mod settings;
 
 use search::{nyaa::NyaaProvider, limetorrents::LimeTorrentsProvider, piratebay::PirateBayProvider, 
              SearchProvider};
@@ -15,6 +19,10 @@ use tauri::{Manager, State};
 use torrent::TorrentManager;
 use tracking::TrackingManager;
 use media_cache::{MediaCache, TrackType};
+use font_manager::FontManager;
+use watch_history::{WatchHistoryManager, WatchHistoryItem};
+use track_preferences::TrackPreferencesManager;
+use settings::{SettingsManager, Settings};
 
 #[tauri::command]
 async fn search_nyaa(query: String) -> Result<Vec<search::SearchResult>, String> {
@@ -383,6 +391,208 @@ async fn load_transcoded_audio(
     torrent_manager.get_transcoded_audio(session_id, file_index).await
 }
 
+#[tauri::command]
+async fn save_font(
+    font_manager: State<'_, FontManager>,
+    filename: String,
+    data: Vec<u8>,
+) -> Result<String, String> {
+    // Check if font is already installed on system
+    if font_manager::is_font_installed(&filename) {
+        println!("Font {} is already installed on system, skipping save", filename);
+        return Ok(format!("system:{}", filename));
+    }
+    
+    let path = font_manager.save_font(&filename, &data)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn check_font_installed(filename: String) -> bool {
+    font_manager::is_font_installed(&filename)
+}
+
+#[tauri::command]
+fn list_fonts(font_manager: State<'_, FontManager>) -> Result<Vec<font_manager::FontInfo>, String> {
+    font_manager.list_fonts()
+}
+
+#[tauri::command]
+fn get_fonts_dir(font_manager: State<'_, FontManager>) -> String {
+    font_manager.get_fonts_dir().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+async fn get_http_port(manager: State<'_, Arc<TorrentManager>>) -> Result<u16, String> {
+    manager.get_http_port().await
+}
+
+#[tauri::command]
+async fn add_watch_history_item(
+    watch_history: State<'_, WatchHistoryManager>,
+    item: WatchHistoryItem,
+) -> Result<(), String> {
+    watch_history.add_item(item).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_watch_history(
+    watch_history: State<'_, WatchHistoryManager>,
+) -> Result<Vec<WatchHistoryItem>, String> {
+    Ok(watch_history.get_history().await)
+}
+
+#[tauri::command]
+async fn remove_watch_history_item(
+    watch_history: State<'_, WatchHistoryManager>,
+    media_id: u32,
+    media_type: String,
+) -> Result<(), String> {
+    watch_history.remove_item(media_id, media_type).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn clear_watch_history(
+    watch_history: State<'_, WatchHistoryManager>,
+) -> Result<(), String> {
+    watch_history.clear().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_track_preference(
+    track_prefs: State<'_, TrackPreferencesManager>,
+    magnet_link: String,
+    audio_track_index: Option<usize>,
+    subtitle_track_index: Option<i32>,
+    subtitle_language: Option<String>,
+) -> Result<(), String> {
+    track_prefs.save_preference(magnet_link, audio_track_index, subtitle_track_index, subtitle_language).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_track_preference(
+    track_prefs: State<'_, TrackPreferencesManager>,
+    magnet_link: String,
+) -> Result<Option<track_preferences::TrackPreference>, String> {
+    Ok(track_prefs.get_preference(&magnet_link).await)
+}
+
+#[tauri::command]
+async fn save_settings(
+    settings_manager: State<'_, SettingsManager>,
+    settings: Settings,
+) -> Result<(), String> {
+    settings_manager.save(settings).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_settings(
+    settings_manager: State<'_, SettingsManager>,
+) -> Result<Settings, String> {
+    Ok(settings_manager.get().await)
+}
+
+#[tauri::command]
+async fn check_external_player(player: String) -> Result<bool, String> {
+    use std::process::Command;
+    
+    let command_name = match player.to_lowercase().as_str() {
+        "mpv" => "mpv",
+        "vlc" => if cfg!(target_os = "windows") { "vlc" } else { "vlc" },
+        _ => return Err(format!("Unsupported player: {}", player)),
+    };
+    
+    // On Windows, check common VLC installation paths
+    #[cfg(target_os = "windows")]
+    if player.to_lowercase() == "vlc" {
+        use std::path::Path;
+        let common_paths = vec![
+            r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+            r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+        ];
+        
+        for path in common_paths {
+            if Path::new(path).exists() {
+                return Ok(true);
+            }
+        }
+    }
+    
+    #[cfg(target_os = "windows")]
+    let check_result = Command::new("where")
+        .arg(command_name)
+        .output();
+    
+    #[cfg(not(target_os = "windows"))]
+    let check_result = Command::new("which")
+        .arg(command_name)
+        .output();
+    
+    match check_result {
+        Ok(output) => Ok(output.status.success()),
+        Err(_) => Ok(false),
+    }
+}
+
+#[tauri::command]
+async fn open_in_external_player(
+    player: String,
+    stream_url: String,
+    title: String,
+) -> Result<(), String> {
+    use std::process::Command;
+    
+    let command_name = match player.to_lowercase().as_str() {
+        "mpv" => "mpv".to_string(),
+        "vlc" => {
+            // On Windows, try to find VLC in common installation paths
+            #[cfg(target_os = "windows")]
+            {
+                use std::path::Path;
+                let common_paths = vec![
+                    r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+                    r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+                ];
+                
+                common_paths.iter()
+                    .find(|path| Path::new(path).exists())
+                    .map(|path| path.to_string())
+                    .unwrap_or_else(|| "vlc".to_string())
+            }
+            #[cfg(not(target_os = "windows"))]
+            "vlc".to_string()
+        },
+        _ => return Err(format!("Unsupported player: {}", player)),
+    };
+    
+    let mut cmd = Command::new(&command_name);
+    
+    // Add player-specific arguments
+    match player.to_lowercase().as_str() {
+        "mpv" => {
+            cmd.arg(&stream_url)
+                .arg(format!("--title={}", title))
+                .arg("--force-window=immediate");
+        },
+        "vlc" => {
+            cmd.arg(&stream_url)
+                .arg(format!("--meta-title={}", title));
+        },
+        _ => return Err(format!("Unsupported player: {}", player)),
+    }
+    
+    // Spawn the process
+    cmd.spawn()
+        .map_err(|e| format!("Failed to launch {}: {}", player, e))?;
+    
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -405,6 +615,19 @@ fn main() {
 
             let media_cache = MediaCache::new(app_data_dir.clone());
             app.manage(media_cache);
+
+            let watch_history_manager = WatchHistoryManager::new(app_data_dir.clone());
+            app.manage(watch_history_manager);
+
+            let track_preferences_manager = TrackPreferencesManager::new(app_data_dir.clone());
+            app.manage(track_preferences_manager);
+
+            let settings_manager = SettingsManager::new(app_data_dir.clone());
+            app.manage(settings_manager);
+
+            let font_manager = FontManager::new(&app_handle)
+                .expect("failed to create font manager");
+            app.manage(font_manager);
 
             let torrent_dir = app_data_dir.join("torrents");
             let torrent_manager = tauri::async_runtime::block_on(async {
@@ -441,6 +664,8 @@ fn main() {
             torrent::resume_torrent,
             torrent::remove_torrent,
             torrent::get_download_dir,
+            torrent::extract_subtitle,
+            torrent::extract_audio_track,
             search_nyaa,
             search_nyaa_filtered,
             search_eztv_by_imdb,
@@ -452,7 +677,22 @@ fn main() {
             save_audio_cache,
             load_audio_cache,
             clear_audio_cache,
-            load_transcoded_audio
+            load_transcoded_audio,
+            save_font,
+            check_font_installed,
+            list_fonts,
+            get_fonts_dir,
+            get_http_port,
+            add_watch_history_item,
+            get_watch_history,
+            remove_watch_history_item,
+            clear_watch_history,
+            save_track_preference,
+            get_track_preference,
+            save_settings,
+            get_settings,
+            check_external_player,
+            open_in_external_player
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

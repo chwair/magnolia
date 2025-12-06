@@ -12,7 +12,7 @@ export async function fetchSubtitles(mediaId, mediaType, seasonNum = null, episo
       params.episode = episodeNum;
     }
 
-    console.log("Fetching Wyzie subtitles with params:", params);
+    console.log("fetching Wyzie subtitles with params:", params);
     const subtitles = await searchSubtitles(params);
     console.log("Wyzie subtitles found:", subtitles.length);
     
@@ -25,7 +25,7 @@ export async function fetchSubtitles(mediaId, mediaType, seasonNum = null, episo
       return true;
     });
     
-    console.log("Unique Wyzie subtitles after deduplication:", uniqueSubs.length);
+    console.log("unique Wyzie subtitles after deduplication:", uniqueSubs.length);
     
     return uniqueSubs.map(sub => ({
       id: sub.id,
@@ -39,7 +39,7 @@ export async function fetchSubtitles(mediaId, mediaType, seasonNum = null, episo
       name: `${sub.display}${sub.isHearingImpaired ? " (HI)" : ""}`
     }));
   } catch (error) {
-    console.error("Failed to fetch Wyzie subtitles:", error);
+    console.error("failed to fetch Wyzie subtitles:", error);
     return [];
   }
 }
@@ -53,7 +53,7 @@ export async function downloadSubtitle(url) {
     const text = await response.text();
     return text;
   } catch (error) {
-    console.error("Failed to download subtitle:", error);
+    console.error("failed to download subtitle:", error);
     throw error;
   }
 }

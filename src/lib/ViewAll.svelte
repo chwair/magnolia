@@ -114,7 +114,7 @@ function toggleMyList(event, item) {
   if (!item.media_type) {
     item.media_type = type === 'tv' ? 'tv' : 'movie';
   }
-  console.log('📋 ViewAll: Toggle for:', item.title || item.name);
+  console.log('viewall: toggle for:', item.title || item.name);
   myListStore.toggleItem(item);
 }
 

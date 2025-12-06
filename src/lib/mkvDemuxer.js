@@ -1,4 +1,5 @@
 import { WebDemuxer } from 'web-demuxer';
+import { invoke } from '@tauri-apps/api/core';
 
 export class MKVDemuxer {
   constructor() {
@@ -383,6 +384,62 @@ export class MKVDemuxer {
     }
   }
 
+  /**
+   * Read subtitle packets in a time window for streaming playback
+   */
+  async readSubtitlePacketsInWindow(trackIndex, startTime, endTime) {
+    if (!this.subtitleTracks[trackIndex] || !this.demuxer) return [];
+
+    const track = this.subtitleTracks[trackIndex];
+    const streamIndex = track.rawStream?.index ?? track.id;
+    const decoder = new TextDecoder('utf-8');
+    const subtitleEntries = [];
+
+    try {
+      const stream = this.demuxer.readAVPacket(
+        Math.max(0, startTime - 5), // Start 5s before for context
+        endTime + 5, // End 5s after
+        3, // AVMediaType.AVMEDIA_TYPE_SUBTITLE
+        streamIndex,
+        1 // seek flag
+      );
+      const reader = stream.getReader();
+
+      try {
+        let packetCount = 0;
+        const maxPackets = 1000; // Reasonable limit for a time window
+
+        while (packetCount < maxPackets) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          packetCount++;
+
+          if (value && value.data && value.data.byteLength > 0) {
+            const text = decoder.decode(value.data).trim();
+            if (text) {
+              subtitleEntries.push({
+                start: value.timestamp || 0,
+                end: (value.timestamp || 0) + (value.duration || 0),
+                text: text
+              });
+            }
+          }
+        }
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch (e) {
+          // Ignore
+        }
+      }
+
+      return subtitleEntries;
+    } catch (error) {
+      console.error('Error reading subtitle window:', error);
+      return [];
+    }
+  }
+
   async extractSubtitleTrack(trackIndex) {
     if (!this.subtitleTracks[trackIndex]) return null;
 
@@ -665,6 +722,137 @@ export class MKVDemuxer {
   
   getAllAttachments() {
     return this.attachments || [];
+  }
+
+  async extractAndSaveFonts() {
+    const savedFonts = [];
+    
+    console.log(`[Font Extractor] Starting extraction for ${this.attachments.length} attachments`);
+    
+    if (this.attachments.length === 0) {
+      console.log('[Font Extractor] No attachments to process');
+      return savedFonts;
+    }
+    
+    try {
+      // Test if Tauri is available
+      console.log('[Font Extractor] Testing Tauri API availability...');
+      await invoke('check_font_installed', { filename: 'test.ttf' }).catch(() => {});
+      console.log('[Font Extractor] Tauri API is available');
+    } catch (error) {
+      console.error('[Font Extractor] Tauri API not available:', error);
+      return savedFonts;
+    }
+    
+    for (const attachment of this.attachments) {
+      try {
+        console.log(`[Font Extractor] Processing: ${attachment.filename}`);
+        
+        // Check if already installed on system
+        const isInstalled = await invoke('check_font_installed', { 
+          filename: attachment.filename 
+        });
+        
+        if (isInstalled) {
+          console.log(`[Font Extractor] ${attachment.filename} already on system, skipping`);
+          savedFonts.push({
+            filename: attachment.filename,
+            location: 'system',
+            skipped: true
+          });
+          continue;
+        }
+        
+        // Extract font data
+        const fontData = attachment.data;
+        if (!fontData) {
+          console.warn(`[Font Extractor] No data for ${attachment.filename}`);
+          continue;
+        }
+        
+        console.log(`[Font Extractor] Converting ${attachment.filename} (${fontData.byteLength || fontData.length} bytes)`);
+        
+        // Convert to regular array for Tauri
+        const dataArray = Array.from(new Uint8Array(fontData));
+        
+        console.log(`[Font Extractor] Saving ${attachment.filename} to disk...`);
+        
+        // Save to app data fonts directory
+        const savedPath = await invoke('save_font', {
+          filename: attachment.filename,
+          data: dataArray
+        });
+        
+        console.log(`[Font Extractor] ✓ Saved ${attachment.filename} to ${savedPath}`);
+        
+        // Get the HTTP server port from torrent manager
+        // Font will be served at http://localhost:{port}/fonts/{filename}
+        const httpPort = await invoke('get_http_port');
+        const httpUrl = `http://localhost:${httpPort}/fonts/${encodeURIComponent(attachment.filename)}`;
+        
+        console.log(`[Font Extractor] Font URL: ${httpUrl}`);
+        
+        savedFonts.push({
+          filename: attachment.filename,
+          location: savedPath,
+          url: httpUrl,
+          size: dataArray.length
+        });
+      } catch (error) {
+        console.error(`[Font Extractor] Failed to save ${attachment.filename}:`, error);
+      }
+    }
+    
+    console.log(`[Font Extractor] Extraction complete. Saved ${savedFonts.length} fonts`);
+    return savedFonts;
+  }
+
+  async embedFontsIntoASS(assData, fonts) {
+    if (!fonts || fonts.length === 0) {
+      console.log('[Font Embedder] No fonts to embed');
+      return assData;
+    }
+
+    console.log(`[Font Embedder] Embedding ${fonts.length} fonts into ASS data`);
+    
+    // Read font files and encode as base64
+    const fontSections = [];
+    
+    for (const font of fonts) {
+      if (font.skipped || !font.location) continue;
+      
+      try {
+        const fontBytes = await readBinaryFile(font.location);
+        const base64 = btoa(String.fromCharCode(...new Uint8Array(fontBytes)));
+        
+        // Create font attachment section
+        const fontSection = `[${font.filename}]\nfontname: ${font.filename}\n` +
+          base64.match(/.{1,80}/g).join('\n');
+        
+        fontSections.push(fontSection);
+        console.log(`[Font Embedder] Embedded ${font.filename}`);
+      } catch (error) {
+        console.error(`[Font Embedder] Failed to embed ${font.filename}:`, error);
+      }
+    }
+    
+    if (fontSections.length === 0) {
+      return assData;
+    }
+    
+    // Insert font sections before [Events] section
+    const eventsIndex = assData.indexOf('[Events]');
+    if (eventsIndex === -1) {
+      console.warn('[Font Embedder] No [Events] section found in ASS data');
+      return assData;
+    }
+    
+    const beforeEvents = assData.substring(0, eventsIndex);
+    const afterEvents = assData.substring(eventsIndex);
+    const fontsSection = '\n' + fontSections.join('\n\n') + '\n\n';
+    
+    console.log(`[Font Embedder] Successfully embedded ${fontSections.length} fonts`);
+    return beforeEvents + fontsSection + afterEvents;
   }
 
   createADTSHeader(frameLength, sampleRate, channels) {

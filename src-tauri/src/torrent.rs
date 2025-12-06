@@ -119,11 +119,43 @@ pub struct AppState {
     pub hls_cache: Arc<Mutex<HashMap<String, PathBuf>>>,
     pub transcode_states: Arc<RwLock<HashMap<(usize, usize), TranscodeState>>>,
     pub metadata_cache: Arc<RwLock<HashMap<(usize, usize), MkvMetadata>>>,
+    pub download_dir: PathBuf,
 }
 
 struct TorrentEntry {
     magnet_url: String,
     session_id: Option<usize>, // None if not yet added to session
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CachedTorrent {
+    handle_id: usize,
+    session_id: usize,
+    magnet_url: String,
+    #[serde(with = "systemtime_serde")]
+    cached_at: std::time::SystemTime,
+}
+
+// Serde helper for SystemTime
+mod systemtime_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    pub fn serialize<S>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let duration = time.duration_since(UNIX_EPOCH).unwrap();
+        duration.as_secs().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SystemTime, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let secs = u64::deserialize(deserializer)?;
+        Ok(UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    }
 }
 
 // Transcoding state for a specific file
@@ -145,6 +177,8 @@ pub struct TorrentManager {
     transcode_states: Arc<RwLock<HashMap<(usize, usize), TranscodeState>>>,
     // Cache metadata by (session_id, file_index)
     metadata_cache: Arc<RwLock<HashMap<(usize, usize), MkvMetadata>>>,
+    // Torrent cache: keep up to 10 torrents paused with data cleared
+    torrent_cache: Arc<RwLock<Vec<CachedTorrent>>>,
 }
 
 async fn get_file_metadata(
@@ -496,13 +530,17 @@ impl TorrentManager {
             hls_cache: Arc::new(Mutex::new(HashMap::new())),
             transcode_states: transcode_states.clone(),
             metadata_cache: metadata_cache.clone(),
+            download_dir: download_dir.clone(),
         };
 
         let app = Router::new()
             .route("/torrents/{session_id}/stream/{file_id}", get(stream_file))
             .route("/torrents/{session_id}/metadata/{file_id}", get(get_file_metadata))
             .route("/torrents/{session_id}/subtitles/{file_id}/{track_index}", get(get_subtitle_track))
+            .route("/torrents/{session_id}/srt-stream/{file_id}/{track_index}", get(stream_srt_subtitles))
+            .route("/torrents/{session_id}/transcoded-audio-stream/{file_id}", get(stream_transcoded_audio))
             .route("/torrents/{session_id}/transcoded-audio/{file_id}", get(serve_transcoded_audio))
+            .route("/fonts/{filename}", get(serve_font))
             .route("/torrents/{session_id}/dash/{file_id}/manifest.mpd", get(crate::dash::dash_manifest))
             .route("/torrents/{session_id}/dash/{file_id}/video/init.mp4", get(crate::dash::dash_video_init))
             .route("/torrents/{session_id}/dash/{file_id}/video/segment/{segment_num}", get(crate::dash::dash_video_segment))
@@ -516,7 +554,7 @@ impl TorrentManager {
             axum::serve(listener, app).await.ok();
         });
 
-        Ok(Self {
+        let manager = Self {
             session,
             download_dir,
             torrents,
@@ -524,7 +562,15 @@ impl TorrentManager {
             http_addr,
             transcode_states,
             metadata_cache,
-        })
+            torrent_cache: Arc::new(RwLock::new(Vec::new())),
+        };
+        
+        // Load cached torrents from disk
+        if let Err(e) = manager.load_cache_from_disk().await {
+            tracing::warn!("Failed to load torrent cache from disk: {}", e);
+        }
+        
+        Ok(manager)
     }
 
     pub async fn add_torrent(&self, magnet_or_url: String) -> Result<usize> {
@@ -605,7 +651,8 @@ impl TorrentManager {
                         .enumerate()
                         .filter_map(|(index, detail)| {
                             let filename_str = detail.filename.to_string().ok()?;
-                            if filename_str.to_lowercase().ends_with(".mkv") {
+                            let lower = filename_str.to_lowercase();
+                            if lower.ends_with(".mkv") || lower.ends_with(".mp4") || lower.ends_with(".avi") || lower.ends_with(".mov") {
                                 let pathbuf = detail.filename.to_pathbuf().ok()?;
                                 let name = pathbuf
                                     .file_name()
@@ -656,7 +703,7 @@ impl TorrentManager {
             .get(TorrentIdOrHash::Id(session_id))
             .context("Session torrent not found")?;
 
-        // Get torrent metadata - filter to only .mkv files
+        // Get torrent metadata - filter to video files (.mkv, .mp4, .avi, .mov)
         let files: Vec<TorrentFile> = handle
             .with_metadata(|meta| {
                 meta.file_infos
@@ -667,8 +714,9 @@ impl TorrentManager {
                             .relative_filename
                             .to_string_lossy()
                             .to_string();
+                        let lower = filename.to_lowercase();
                         
-                        if filename.to_lowercase().ends_with(".mkv") {
+                        if lower.ends_with(".mkv") || lower.ends_with(".mp4") || lower.ends_with(".avi") || lower.ends_with(".mov") {
                             Some(TorrentFile {
                                 index,
                                 name: file_info
@@ -745,6 +793,43 @@ impl TorrentManager {
             .get(&handle_id)
             .context("Torrent handle not found")?;
         
+        // Check if this torrent is in the cache
+        let mut cache = self.torrent_cache.write().await;
+        let cached_session_id = cache.iter()
+            .find(|ct| ct.handle_id == handle_id)
+            .map(|ct| ct.session_id);
+        
+        if let Some(session_id) = cached_session_id {
+            tracing::info!("Found cached torrent for handle_id {}, resuming session_id {}", handle_id, session_id);
+            
+            // Remove from cache
+            cache.retain(|ct| ct.handle_id != handle_id);
+            drop(cache);
+            
+            // Resume the torrent
+            if let Some(handle) = self.session.get(TorrentIdOrHash::Id(session_id)) {
+                // Resume if paused
+                if handle.is_paused() {
+                    self.session.unpause(&handle).await?;
+                }
+                
+                tracing::info!("Resumed cached torrent, session_id {} for handle_id {}", session_id, handle_id);
+                
+                // Update entry with session_id
+                drop(torrents);
+                let mut torrents = self.torrents.write().await;
+                if let Some(entry) = torrents.get_mut(&handle_id) {
+                    entry.session_id = Some(session_id);
+                }
+                
+                return Ok(());
+            } else {
+                tracing::warn!("Cached session_id {} not found in session, adding fresh", session_id);
+            }
+        } else {
+            drop(cache);
+        }
+        
         // Add the torrent with ONLY the specific file selected
         let add_torrent = if entry.magnet_url.starts_with("magnet:") {
             AddTorrent::from_url(&entry.magnet_url)
@@ -779,10 +864,13 @@ impl TorrentManager {
             }
         };
         
+        tracing::info!("Setting session_id {} for handle_id {}", session_id, handle_id);
+        
         drop(torrents);
         let mut torrents = self.torrents.write().await;
         if let Some(entry) = torrents.get_mut(&handle_id) {
             entry.session_id = Some(session_id);
+            tracing::info!("Successfully updated entry.session_id to {}", session_id);
         }
         
         Ok(())
@@ -795,6 +883,7 @@ impl TorrentManager {
             .context("Torrent handle not found")?;
             
         let session_id = entry.session_id.context("Torrent not yet added to session")?;
+        tracing::info!("get_stream_status for handle_id={}, session_id={}, file_index={}", handle_id, session_id, file_index);
         
         let handle = self.session.get(TorrentIdOrHash::Id(session_id)).context("Session torrent not found")?;
         let stats = handle.stats();
@@ -841,8 +930,9 @@ impl TorrentManager {
         };
         
         let stream_info = if is_ready {
-             // Extract MKV metadata if it's an MKV file
-            let mut metadata = if file_name.to_lowercase().ends_with(".mkv") {
+             // Extract metadata for supported video formats
+            let lower = file_name.to_lowercase();
+            let mut metadata = if lower.ends_with(".mkv") || lower.ends_with(".mp4") || lower.ends_with(".avi") || lower.ends_with(".mov") {
                 // If fully downloaded, use the actual file
                 if stats.progress_bytes >= stats.total_bytes && stats.total_bytes > 0 {
                     let file_path = self.download_dir.join(&file_name_path);
@@ -977,10 +1067,180 @@ impl TorrentManager {
         
         let mut torrents = self.torrents.write().await;
         if let Some(entry) = torrents.get_mut(&handle_id) {
-            if let Some(session_id) = entry.session_id.take() {
-                tracing::info!("Deleting torrent session_id: {}", session_id);
-                self.session.delete(TorrentIdOrHash::Id(session_id), delete_files).await?;
+            if let Some(session_id) = entry.session_id {
+                if delete_files {
+                    // Full removal
+                    tracing::info!("Deleting torrent session_id: {} (with files)", session_id);
+                    entry.session_id = None;
+                    self.session.delete(TorrentIdOrHash::Id(session_id), true).await?;
+                } else {
+                    // Cache the torrent: pause it and clear file data
+                    tracing::info!("Caching torrent session_id: {} for handle_id: {}", session_id, handle_id);
+                    
+                    // Pause the torrent first
+                    if let Some(handle) = self.session.get(TorrentIdOrHash::Id(session_id)) {
+                        self.session.pause(&handle).await?;
+                        
+                        // Clear file data to save space
+                        self.clear_torrent_files(session_id, &handle).await?;
+                    }
+                    
+                    // Add to cache
+                    let cached_torrent = CachedTorrent {
+                        handle_id,
+                        session_id,
+                        magnet_url: entry.magnet_url.clone(),
+                        cached_at: std::time::SystemTime::now(),
+                    };
+                    
+                    let mut cache = self.torrent_cache.write().await;
+                    
+                    // Remove if already in cache (by handle_id or magnet_url)
+                    let magnet_url = entry.magnet_url.clone();
+                    cache.retain(|ct| ct.handle_id != handle_id && ct.magnet_url != magnet_url);
+                    
+                    // Add to front of cache
+                    cache.insert(0, cached_torrent);
+                    
+                    // Enforce 10 torrent limit
+                    while cache.len() > 10 {
+                        if let Some(oldest) = cache.pop() {
+                            tracing::info!("Cache limit reached, removing oldest cached torrent: handle_id={}, session_id={}", oldest.handle_id, oldest.session_id);
+                            // Remove from session completely
+                            self.session.delete(TorrentIdOrHash::Id(oldest.session_id), true).await?;
+                            
+                            // Clear session_id from torrent entry
+                            if let Some(old_entry) = torrents.get_mut(&oldest.handle_id) {
+                                old_entry.session_id = None;
+                            }
+                        }
+                    }
+                    
+                    tracing::info!("Torrent cached. Current cache size: {}", cache.len());
+                    drop(cache);
+                    
+                    // Save cache to disk
+                    if let Err(e) = self.save_cache_to_disk().await {
+                        tracing::error!("Failed to save cache to disk: {}", e);
+                    }
+                }
             }
+        }
+        
+        Ok(())
+    }
+    
+    /// Clear file data for a cached torrent to save space while keeping metadata
+    async fn clear_torrent_files(&self, session_id: usize, handle: &librqbit::ManagedTorrent) -> Result<()> {
+        tracing::info!("Clearing file data for session_id: {}", session_id);
+        
+        // Get file paths
+        let file_paths: Vec<PathBuf> = handle.with_metadata(|meta| {
+            meta.file_infos
+                .iter()
+                .map(|info| {
+                    let mut path = self.download_dir.clone();
+                    path.push(info.relative_filename.to_path_buf());
+                    path
+                })
+                .collect()
+        })?;
+        
+        // Delete each file - librqbit will recreate them when needed
+        for path in file_paths {
+            if path.exists() {
+                match tokio::fs::remove_file(&path).await {
+                    Ok(_) => {
+                        tracing::debug!("Deleted file: {:?}", path);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to delete file {:?}: {}", path, e);
+                    }
+                }
+            }
+        }
+        
+        tracing::info!("Files deleted for session_id: {}", session_id);
+        Ok(())
+    }
+    
+    /// Save torrent cache to disk
+    async fn save_cache_to_disk(&self) -> Result<()> {
+        let cache = self.torrent_cache.read().await;
+        let cache_file = self.download_dir.join("torrent_cache.json");
+        
+        let json = serde_json::to_string_pretty(&*cache)?;
+        tokio::fs::write(&cache_file, json).await?;
+        
+        tracing::debug!("Saved {} cached torrents to disk", cache.len());
+        Ok(())
+    }
+    
+    /// Load torrent cache from disk and restore sessions
+    async fn load_cache_from_disk(&self) -> Result<()> {
+        let cache_file = self.download_dir.join("torrent_cache.json");
+        
+        if !cache_file.exists() {
+            return Ok(());
+        }
+        
+        let json = tokio::fs::read_to_string(&cache_file).await?;
+        let cached_torrents: Vec<CachedTorrent> = serde_json::from_str(&json)?;
+        
+        tracing::info!("Loading {} cached torrents from disk", cached_torrents.len());
+        
+        let mut restored_cache = Vec::new();
+        
+        for cached in cached_torrents {
+            // Restore the torrent session in paused state
+            // Don't use list_only - we want the torrent in the session with 0-byte files
+            let add_torrent = AddTorrent::from_url(&cached.magnet_url);
+            
+            let opts = AddTorrentOptions {
+                overwrite: false,
+                paused: true, // Start paused to avoid downloading
+                only_files: None, // No specific files selected yet
+                ..Default::default()
+            };
+            
+            match self.session.add_torrent(add_torrent, Some(opts)).await {
+                Ok(response) => {
+                    let session_id = match response {
+                        AddTorrentResponse::Added(id, _) => {
+                            tracing::info!("Restored cached torrent (newly added): handle_id={}, session_id={}", cached.handle_id, id);
+                            id
+                        }
+                        AddTorrentResponse::AlreadyManaged(id, _) => {
+                            tracing::info!("Restored cached torrent (already managed): handle_id={}, session_id={}", cached.handle_id, id);
+                            id
+                        }
+                        AddTorrentResponse::ListOnly(_) => {
+                            tracing::warn!("Got ListOnly response when trying to restore cached torrent handle_id={}", cached.handle_id);
+                            continue;
+                        }
+                    };
+                    
+                    // Add to restored cache regardless of session_id match
+                    // (session_id might be different if librqbit reassigns IDs)
+                    let mut updated_cached = cached.clone();
+                    updated_cached.session_id = session_id;
+                    restored_cache.push(updated_cached);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to restore cached torrent handle_id={}: {}", cached.handle_id, e);
+                }
+            }
+        }
+        
+        let mut cache = self.torrent_cache.write().await;
+        *cache = restored_cache;
+        
+        tracing::info!("Successfully restored {} cached torrents", cache.len());
+        
+        // Re-save cache with updated session IDs
+        drop(cache);
+        if let Err(e) = self.save_cache_to_disk().await {
+            tracing::error!("Failed to save updated cache: {}", e);
         }
         
         Ok(())
@@ -1038,6 +1298,10 @@ impl TorrentManager {
             }
         }
         Ok(())
+    }
+
+    pub async fn get_http_port(&self) -> Result<u16, String> {
+        Ok(self.http_addr.port())
     }
 
     pub async fn get_transcoded_audio(&self, session_id: usize, file_index: usize) -> Result<Option<Vec<u8>>, String> {
@@ -1372,6 +1636,322 @@ async fn get_media_duration(path: &std::path::Path) -> Result<f64> {
     }
 }
 
+// HTTP handler to stream transcoded audio live (starts playing before transcoding is complete)
+async fn stream_transcoded_audio(
+    Path((session_id, file_id)): Path<(usize, usize)>,
+    headers: HeaderMap,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    
+    tracing::info!("Live transcoded audio stream request: session_id={}, file_id={}", session_id, file_id);
+    
+    // Get the file path from the torrent session
+    let file_path = {
+        let handle = state.session.get(TorrentIdOrHash::Id(session_id));
+        if handle.is_none() {
+            return (StatusCode::NOT_FOUND, "Session not found").into_response();
+        }
+        let h = handle.unwrap();
+        
+        let file_info = h.with_metadata(|meta| {
+            meta.file_infos.get(file_id).map(|fi| (
+                fi.relative_filename.clone(),
+                fi.len
+            ))
+        });
+        
+        match file_info {
+            Ok(Some((file_name_path, _))) => state.download_dir.join(&file_name_path),
+            _ => return (StatusCode::NOT_FOUND, "File not found in torrent").into_response(),
+        }
+    };
+    
+    if !file_path.exists() {
+        tracing::warn!("File not yet available for transcoding: {:?}", file_path);
+        return (StatusCode::SERVICE_UNAVAILABLE, "File not yet downloaded").into_response();
+    }
+    
+    // Check if file has minimum size (at least 1MB to start transcoding)
+    let file_size = match tokio::fs::metadata(&file_path).await {
+        Ok(meta) => meta.len(),
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "File metadata unavailable").into_response(),
+    };
+    
+    if file_size < 1_048_576 {
+        tracing::warn!("File too small for transcoding: {} bytes", file_size);
+        return (StatusCode::SERVICE_UNAVAILABLE, "File not sufficiently downloaded").into_response();
+    }
+    
+    // Parse seek time from range header or query param
+    let seek_time = headers.get("X-Audio-Seek")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    
+    tracing::info!("Starting transcode from {}s", seek_time);
+    
+    // Start ffmpeg transcoding from seek position
+    let mut cmd = Command::new(ffmpeg_path());
+    
+    if seek_time > 0.0 {
+        cmd.args(&["-ss", &seek_time.to_string()]);
+    }
+    
+    cmd.args(&[
+        "-i", file_path.to_str().unwrap(),
+        "-map", "0:a:0",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-f", "adts",
+        "pipe:1",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to spawn ffmpeg: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start transcoding: {}", e)).into_response();
+        }
+    };
+    
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get ffmpeg output").into_response(),
+    };
+    
+    // Spawn task to handle background caching
+    let cache_dir = state.download_dir.join(".audio_cache");
+    tokio::fs::create_dir_all(&cache_dir).await.ok();
+    let cache_key = format!("{:x}", md5::compute(file_path.to_string_lossy().as_bytes()));
+    let cache_path = cache_dir.join(format!("{}.aac", cache_key));
+    
+    // Start background full transcode for caching (if not already running)
+    let transcode_in_progress = {
+        let states = state.transcode_states.read().await;
+        states.contains_key(&(session_id, file_id))
+    };
+    
+    if !transcode_in_progress {
+        let cache_path_clone = cache_path.clone();
+        let file_path_clone = file_path.clone();
+        let state_clone = state.clone();
+        
+        tokio::spawn(async move {
+            let mut cmd = Command::new(ffmpeg_path());
+            cmd.args(&[
+                "-i", file_path_clone.to_str().unwrap(),
+                "-map", "0:a:0",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-f", "adts",
+                cache_path_clone.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+            
+            tracing::info!("Starting background full transcode to cache: {:?}", cache_path_clone);
+            
+            {
+                let mut states = state_clone.transcode_states.write().await;
+                states.insert((session_id, file_id), TranscodeState {
+                    output_path: Some(cache_path_clone.clone()),
+                    completed: false,
+                    progress: 0.0,
+                    error: None,
+                });
+            }
+            
+            let result = cmd.spawn().and_then(|mut child| {
+                tokio::runtime::Handle::current().block_on(child.wait())
+            });
+            
+            {
+                let mut states = state_clone.transcode_states.write().await;
+                if let Some(state) = states.get_mut(&(session_id, file_id)) {
+                    state.completed = result.is_ok();
+                    state.progress = if result.is_ok() { 100.0 } else { 0.0 };
+                }
+            }
+            
+            if result.is_ok() {
+                tracing::info!("Background transcode completed: {:?}", cache_path_clone);
+            } else {
+                tracing::error!("Background transcode failed: {:?}", result.err());
+            }
+        });
+    }
+    
+    // Stream the transcoded audio to the client
+    let stream = tokio_util::io::ReaderStream::new(stdout);
+    let body = Body::from_stream(stream);
+    
+    // Spawn task to wait for ffmpeg completion (non-blocking)
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "audio/aac")
+        .header(header::TRANSFER_ENCODING, "chunked")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .unwrap()
+        .into_response()
+}
+
+async fn stream_srt_subtitles(
+    Path((session_id, file_id, track_index)): Path<(usize, usize, usize)>,
+    headers: HeaderMap,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl IntoResponse {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    
+    tracing::info!("========================================");
+    tracing::info!("SRT subtitle stream request received:");
+    tracing::info!("  session_id={}", session_id);
+    tracing::info!("  file_id={}", file_id);
+    tracing::info!("  track_index={}", track_index);
+    tracing::info!("========================================");
+    
+    // Get the file path from the torrent session
+    let file_path = {
+        let handle = state.session.get(TorrentIdOrHash::Id(session_id));
+        if handle.is_none() {
+            tracing::error!("Session {} not found in librqbit session", session_id);
+            return (StatusCode::NOT_FOUND, "Session not found").into_response();
+        }
+        let h = handle.unwrap();
+        
+        let file_info = h.with_metadata(|meta| {
+            meta.file_infos.get(file_id).map(|fi| (
+                fi.relative_filename.clone(),
+                fi.len
+            ))
+        });
+        
+        match file_info {
+            Ok(Some((file_name_path, _))) => state.download_dir.join(&file_name_path),
+            _ => return (StatusCode::NOT_FOUND, "File not found in torrent").into_response(),
+        }
+    };
+    
+    if !file_path.exists() {
+        tracing::warn!("File not yet available for subtitle extraction: {:?}", file_path);
+        return (StatusCode::SERVICE_UNAVAILABLE, "File not yet downloaded").into_response();
+    }
+    
+    // Parse time window from headers
+    let start_time = headers.get("X-Subtitle-Start")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    
+    let end_time = headers.get("X-Subtitle-End")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(start_time + 60.0);
+    
+    tracing::info!("Extracting SRT subtitles from {}s to {}s", start_time, end_time);
+    
+    // Extract subtitle track using ffmpeg
+    let mut cmd = Command::new(ffmpeg_path());
+    
+    cmd.args(&[
+        "-ss", &start_time.to_string(),
+        "-t", &(end_time - start_time).to_string(),
+        "-i", file_path.to_str().unwrap(),
+        "-map", &format!("0:s:{}", track_index),
+        "-f", "srt",
+        "pipe:1",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to spawn ffmpeg for SRT extraction: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to extract subtitles: {}", e)).into_response();
+        }
+    };
+    
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get ffmpeg output").into_response(),
+    };
+    
+    // Stream the extracted subtitles to the client
+    let stream = tokio_util::io::ReaderStream::new(stdout);
+    let body = Body::from_stream(stream);
+    
+    // Spawn task to wait for ffmpeg completion (non-blocking)
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::TRANSFER_ENCODING, "chunked")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .unwrap()
+        .into_response()
+}
+
+// HTTP handler to serve fonts from app data directory
+async fn serve_font(
+    Path(filename): Path<String>,
+) -> impl IntoResponse {
+    // Get fonts directory from app data
+    // Note: In Axum handlers we can't easily access AppHandle, so we'll construct the path manually
+    // The fonts are stored in AppData/Roaming/com.chair.magnolia/fonts/
+    
+    let app_data = match dirs::data_dir() {
+        Some(dir) => dir.join("com.chair.magnolia").join("fonts"),
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "Could not find app data directory").into_response(),
+    };
+    
+    let font_path = app_data.join(&filename);
+    
+    // Security: ensure the path is within fonts directory
+    if !font_path.starts_with(&app_data) {
+        return (StatusCode::FORBIDDEN, "Access denied").into_response();
+    }
+    
+    // Read font file
+    let font_data = match tokio::fs::read(&font_path).await {
+        Ok(data) => data,
+        Err(_) => return (StatusCode::NOT_FOUND, "Font not found").into_response(),
+    };
+    
+    // Determine content type based on extension
+    let content_type = if filename.ends_with(".ttf") {
+        "font/ttf"
+    } else if filename.ends_with(".otf") {
+        "font/otf"
+    } else if filename.ends_with(".woff") {
+        "font/woff"
+    } else if filename.ends_with(".woff2") {
+        "font/woff2"
+    } else {
+        "application/octet-stream"
+    };
+    
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    headers.insert(header::CACHE_CONTROL, "public, max-age=31536000".parse().unwrap());
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+    
+    (StatusCode::OK, headers, font_data).into_response()
+}
+
 // HTTP handler to serve transcoded audio file
 async fn serve_transcoded_audio(
     Path((session_id, file_id)): Path<(usize, usize)>,
@@ -1564,4 +2144,440 @@ pub async fn get_download_dir(manager: State<'_, Arc<TorrentManager>>) -> Result
         .get_download_dir()
         .to_string_lossy()
         .to_string())
+}
+
+#[tauri::command]
+pub async fn extract_subtitle(
+    manager: State<'_, Arc<TorrentManager>>,
+    handle_id: usize,
+    file_index: usize,
+    track_index: usize,
+) -> Result<String, String> {
+    use tokio::process::Command;
+    use tokio::io::AsyncReadExt;
+    
+    tracing::info!("Extracting subtitle chunk: handle_id={}, file_index={}, track_index={}", handle_id, file_index, track_index);
+    
+    // Get the torrent entry with retry for session_id
+    let session_id = {
+        let mut retries = 0;
+        loop {
+            let torrents = manager.torrents.read().await;
+            let entry = torrents
+                .get(&handle_id)
+                .ok_or("Torrent handle not found")?;
+            
+            if let Some(sid) = entry.session_id {
+                drop(torrents);
+                break sid;
+            }
+            
+            drop(torrents);
+            
+            if retries >= 10 {
+                return Err("Torrent session not ready after 5 seconds. Please wait for video to start loading.".to_string());
+            }
+            
+            retries += 1;
+            tracing::info!("Session ID not yet available, waiting... (attempt {}/10)", retries);
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    };
+    
+    // Get handle from librqbit session
+    let handle = manager.session.get(TorrentIdOrHash::Id(session_id))
+        .ok_or("Session not found")?;
+    
+    // Get file info and size
+    let (file_info, file_size) = handle.with_metadata(|meta| {
+        meta.file_infos.get(file_index).map(|fi| (fi.relative_filename.clone(), fi.len))
+    }).map_err(|e| e.to_string())?
+        .ok_or("File index out of range")?;
+    
+    let file_path = manager.download_dir.join(&file_info);
+    
+    // Check if file is fully downloaded on disk
+    if file_path.exists() {
+        let metadata = tokio::fs::metadata(&file_path).await
+            .map_err(|e| format!("Failed to get file metadata: {}", e))?;
+        
+        if metadata.len() == file_size {
+            tracing::info!("File fully downloaded, extracting complete subtitles from disk");
+            
+            // Extract subtitle using ffmpeg directly from file
+            let output = Command::new(ffmpeg_path())
+                .args(&[
+                    "-i", file_path.to_str().unwrap(),
+                    "-map", &format!("0:s:{}", track_index),
+                    "-f", "srt",
+                    "-"
+                ])
+                .output()
+                .await
+                .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+            
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::error!("ffmpeg subtitle extraction failed: {}", stderr);
+                return Err(format!("Subtitle extraction failed: {}", stderr));
+            }
+            
+            let subtitle_text = String::from_utf8(output.stdout)
+                .map_err(|e| format!("Invalid UTF-8 in subtitle data: {}", e))?;
+            
+            tracing::info!("Successfully extracted complete subtitle, {} bytes", subtitle_text.len());
+            return Ok(subtitle_text);
+        }
+    }
+    
+    // File not fully downloaded, extract from first 150MB for initial subtitles
+    // (enough to get subtitles from beginning and throughout most movies)
+    tracing::info!("Extracting initial subtitle chunk from streaming data");
+    
+    // Create a torrent reader for streaming
+    let mut reader = handle.stream(file_index)
+        .map_err(|e| format!("Failed to create stream: {}", e))?;
+    
+    // Read to a temporary location
+    let temp_dir = std::env::temp_dir();
+    let temp_file_path = temp_dir.join(format!("magnolia_sub_{}_{}.mkv", session_id, file_index));
+    
+    let mut temp_file = tokio::fs::File::create(&temp_file_path).await
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    
+    // Read first 150MB or until EOF (whichever comes first)
+    let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunks
+    let mut total_read = 0u64;
+    let initial_read_limit = 150 * 1024 * 1024; // 150MB
+    
+    tracing::info!("Reading initial {} MB for subtitle extraction", initial_read_limit / (1024 * 1024));
+    
+    while total_read < initial_read_limit {
+        match reader.read(&mut buffer).await {
+            Ok(0) => {
+                tracing::info!("Reached EOF at {} bytes", total_read);
+                break; // EOF
+            }
+            Ok(n) => {
+                tokio::io::AsyncWriteExt::write_all(&mut temp_file, &buffer[..n]).await
+                    .map_err(|e| format!("Failed to write temp file: {}", e))?;
+                total_read += n as u64;
+            }
+            Err(e) => {
+                tracing::warn!("Error reading stream for subtitles: {}, have {} bytes", e, total_read);
+                break;
+            }
+        }
+    }
+    
+    temp_file.sync_all().await.map_err(|e| format!("Failed to sync temp file: {}", e))?;
+    drop(temp_file);
+    
+    tracing::info!("Finished reading {} bytes, extracting subtitles with ffmpeg", total_read);
+    
+    // Extract subtitle using ffmpeg
+    let output = Command::new(ffmpeg_path())
+        .args(&[
+            "-i", temp_file_path.to_str().unwrap(),
+            "-map", &format!("0:s:{}", track_index),
+            "-f", "srt",
+            "-"
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    
+    // Clean up temp file
+    let _ = tokio::fs::remove_file(&temp_file_path).await;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("ffmpeg subtitle extraction failed: {}", stderr);
+        return Err(format!("Subtitle extraction failed: {}", stderr));
+    }
+    
+    let subtitle_text = String::from_utf8(output.stdout)
+        .map_err(|e| format!("Invalid UTF-8 in subtitle data: {}", e))?;
+    
+    tracing::info!("Successfully extracted initial subtitle chunk, {} bytes", subtitle_text.len());
+    
+    // Start background task to extract complete subtitles
+    let manager_clone = manager.inner().clone();
+    let handle_clone = handle_id;
+    let file_clone = file_index;
+    let track_clone = track_index;
+    
+    tokio::spawn(async move {
+        if let Err(e) = extract_complete_subtitle_background(
+            manager_clone,
+            handle_clone,
+            file_clone,
+            track_clone
+        ).await {
+            tracing::error!("Background subtitle extraction failed: {}", e);
+        }
+    });
+    
+    Ok(subtitle_text)
+}
+
+async fn extract_complete_subtitle_background(
+    manager: Arc<TorrentManager>,
+    handle_id: usize,
+    file_index: usize,
+    track_index: usize,
+) -> Result<(), String> {
+    use tokio::process::Command;
+    use tokio::io::AsyncReadExt;
+    
+    tracing::info!("[Background] Starting complete subtitle extraction for handle={}, file={}, track={}", 
+        handle_id, file_index, track_index);
+    
+    // Small delay to let initial playback start
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    
+    // Get the torrent entry
+    let torrents = manager.torrents.read().await;
+    let entry = torrents
+        .get(&handle_id)
+        .ok_or("Torrent handle not found")?;
+        
+    let session_id = entry.session_id.ok_or("Torrent not yet added to session")?;
+    drop(torrents);
+    
+    // Get handle from librqbit session
+    let handle = manager.session.get(TorrentIdOrHash::Id(session_id))
+        .ok_or("Session not found")?;
+    
+    // Get file info and size
+    let (file_info, file_size) = handle.with_metadata(|meta| {
+        meta.file_infos.get(file_index).map(|fi| (fi.relative_filename.clone(), fi.len))
+    }).map_err(|e| e.to_string())?
+        .ok_or("File index out of range")?;
+    
+    let file_path = manager.download_dir.join(&file_info);
+    
+    // Check if already on disk
+    if file_path.exists() {
+        let metadata = tokio::fs::metadata(&file_path).await
+            .map_err(|e| format!("Failed to get file metadata: {}", e))?;
+        
+        if metadata.len() == file_size {
+            tracing::info!("[Background] File already complete on disk, no need to extract");
+            return Ok(());
+        }
+    }
+    
+    // Create a torrent reader for streaming
+    let mut reader = handle.stream(file_index)
+        .map_err(|e| format!("Failed to create stream: {}", e))?;
+    
+    // Read entire file to temp location
+    let temp_dir = std::env::temp_dir();
+    let temp_file_path = temp_dir.join(format!("magnolia_sub_full_{}_{}.mkv", session_id, file_index));
+    
+    let mut temp_file = tokio::fs::File::create(&temp_file_path).await
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut total_read = 0u64;
+    
+    tracing::info!("[Background] Reading complete file ({} bytes) for full subtitle extraction", file_size);
+    
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => {
+                tracing::info!("[Background] Reached EOF at {} bytes", total_read);
+                break;
+            }
+            Ok(n) => {
+                tokio::io::AsyncWriteExt::write_all(&mut temp_file, &buffer[..n]).await
+                    .map_err(|e| format!("Failed to write temp file: {}", e))?;
+                total_read += n as u64;
+                
+                // Log progress every 100MB
+                if total_read % (100 * 1024 * 1024) < (n as u64) {
+                    tracing::info!("[Background] Progress: {} / {} bytes ({:.1}%)", 
+                        total_read, file_size, (total_read as f64 / file_size as f64) * 100.0);
+                }
+            }
+            Err(e) => {
+                tracing::error!("[Background] Error reading stream: {}", e);
+                let _ = tokio::fs::remove_file(&temp_file_path).await;
+                return Err(format!("Failed to read stream: {}", e));
+            }
+        }
+    }
+    
+    temp_file.sync_all().await.map_err(|e| format!("Failed to sync: {}", e))?;
+    drop(temp_file);
+    
+    tracing::info!("[Background] Extracting complete subtitles with ffmpeg");
+    
+    // Extract complete subtitle
+    let output = Command::new(ffmpeg_path())
+        .args(&[
+            "-i", temp_file_path.to_str().unwrap(),
+            "-map", &format!("0:s:{}", track_index),
+            "-f", "srt",
+            "-"
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    
+    let _ = tokio::fs::remove_file(&temp_file_path).await;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("[Background] ffmpeg extraction failed: {}", stderr);
+        return Err(format!("Extraction failed: {}", stderr));
+    }
+    
+    let subtitle_text = String::from_utf8(output.stdout)
+        .map_err(|e| format!("Invalid UTF-8: {}", e))?;
+    
+    tracing::info!("[Background] Complete subtitle extracted, {} bytes. Saving to cache...", subtitle_text.len());
+    
+    // Save to cache
+    // Use the magnet hash as cache key
+    let torrents = manager.torrents.read().await;
+    if let Some(entry) = torrents.get(&handle_id) {
+        // Extract info hash from magnet link for stable cache ID
+        if let Some(hash_start) = entry.magnet_url.find("btih:") {
+            let hash_part = &entry.magnet_url[hash_start + 5..];
+            let hash_end = hash_part.find('&').unwrap_or(hash_part.len());
+            let info_hash = &hash_part[..hash_end];
+            
+            let cache_key = format!("{}-{}-{}", info_hash, file_index, track_index);
+            
+            // Save using the subtitle cache system
+            if let Err(e) = tokio::fs::write(
+                std::env::temp_dir().join(format!("magnolia_subtitle_cache_{}.srt", cache_key)),
+                &subtitle_text
+            ).await {
+                tracing::error!("[Background] Failed to save subtitle cache: {}", e);
+            } else {
+                tracing::info!("[Background] Complete subtitle saved to cache");
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn extract_audio_track(
+    manager: State<'_, Arc<TorrentManager>>,
+    handle_id: usize,
+    file_index: usize,
+    track_index: usize,
+) -> Result<Vec<u8>, String> {
+    tracing::info!("extracting audio track: handle_id={}, file_index={}, track_index={}", handle_id, file_index, track_index);
+    
+    // Get the torrent entry with retry for session_id
+    let session_id = {
+        let mut retries = 0;
+        loop {
+            let torrents = manager.torrents.read().await;
+            let entry = torrents
+                .get(&handle_id)
+                .ok_or("Torrent handle not found")?;
+            
+            if let Some(sid) = entry.session_id {
+                drop(torrents);
+                break sid;
+            }
+            
+            drop(torrents);
+            
+            if retries >= 10 {
+                return Err("Torrent session not ready after 5 seconds".to_string());
+            }
+            
+            retries += 1;
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    };
+    
+    // Get handle from librqbit session
+    let handle = manager.session.get(TorrentIdOrHash::Id(session_id))
+        .ok_or("Session not found")?;
+    
+    // Get file info
+    let (file_info, file_size) = handle.with_metadata(|meta| {
+        meta.file_infos.get(file_index).map(|fi| (fi.relative_filename.clone(), fi.len))
+    }).map_err(|e| e.to_string())?
+        .ok_or("File index out of range")?;
+    
+    let file_path = manager.download_dir.join(&file_info);
+    
+    // Check if file is fully downloaded - if so, extract from disk
+    if file_path.exists() {
+        let metadata = tokio::fs::metadata(&file_path).await
+            .map_err(|e| format!("Failed to get file metadata: {}", e))?;
+        
+        if metadata.len() == file_size {
+            tracing::info!("File fully downloaded, extracting audio from disk");
+            return extract_audio_from_file(&file_path, track_index).await;
+        }
+    }
+    
+    // File not fully downloaded, stream it to temp location first
+    tracing::info!("File not fully downloaded, streaming to temp location");
+    
+    let mut reader = handle.stream(file_index)
+        .map_err(|e| format!("Failed to create stream: {}", e))?;
+    
+    let temp_dir = std::env::temp_dir();
+    let temp_file_path = temp_dir.join(format!("magnolia_audio_{}_{}.tmp", session_id, file_index));
+    
+    let mut temp_file = tokio::fs::File::create(&temp_file_path).await
+        .map_err(|e| format!("Failed to create temp file: {}", e))?;
+    
+    // Copy entire file to temp location
+    tracing::info!("Streaming file to temp location...");
+    tokio::io::copy(&mut reader, &mut temp_file).await
+        .map_err(|e| format!("Failed to stream file: {}", e))?;
+    
+    temp_file.sync_all().await
+        .map_err(|e| format!("Failed to sync temp file: {}", e))?;
+    drop(temp_file);
+    
+    // Extract audio from temp file
+    let result = extract_audio_from_file(&temp_file_path, track_index).await;
+    
+    // Clean up temp file
+    let _ = tokio::fs::remove_file(&temp_file_path).await;
+    
+    result
+}
+
+async fn extract_audio_from_file(file_path: &std::path::Path, track_index: usize) -> Result<Vec<u8>, String> {
+    use tokio::process::Command;
+    
+    tracing::info!("Extracting audio track {} from {:?}", track_index, file_path);
+    
+    // Use ffmpeg to extract and remux audio track
+    // Output to matroska format which can contain any codec properly
+    let output = Command::new(ffmpeg_path())
+        .args(&[
+            "-i", file_path.to_str().unwrap(),
+            "-map", &format!("0:a:{}", track_index),
+            "-c:a", "copy", // Copy codec without re-encoding
+            "-f", "matroska", // Output as MKV which supports all codecs
+            "-"
+        ])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("ffmpeg audio extraction failed: {}", stderr);
+        return Err(format!("Audio extraction failed: {}", stderr));
+    }
+    
+    tracing::info!("Successfully extracted audio track, {} bytes", output.stdout.len());
+    Ok(output.stdout)
 }

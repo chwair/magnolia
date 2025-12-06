@@ -67,7 +67,8 @@
     if (media) {
       // Ensure media_type is set
       if (!media.media_type) {
-        media.media_type = media.title ? "movie" : "tv";
+        // If it has 'name' field (TMDB TV show), it's tv, otherwise movie
+        media.media_type = media.name && !media.title ? "tv" : "movie";
       }
     }
   }
@@ -195,7 +196,7 @@
     loading = true;
     details = null; // Clear previous details to prevent stale data
     try {
-      if (media.media_type === "movie" || media.title) {
+      if (media.media_type === "movie") {
         details = await getMovieDetails(media.id);
         credits = await getMovieCredits(media.id);
       } else {
@@ -246,7 +247,7 @@
   async function loadRecommendations() {
     try {
       let response;
-      if (media.media_type === "movie" || media.title) {
+      if (media.media_type === "movie") {
         response = await getMovieRecommendations(media.id);
       } else {
         response = await getTVRecommendations(media.id);
@@ -254,8 +255,7 @@
       recommendations = (response?.results?.slice(0, 10) || []).map((rec) => {
         // Ensure media_type is set for recommendations
         if (!rec.media_type) {
-          rec.media_type =
-            media.media_type === "movie" || media.title ? "movie" : "tv";
+          rec.media_type = media.media_type;
         }
         return rec;
       });
@@ -464,7 +464,7 @@
     // Use resumeProgress if passed from quick play, otherwise load from store
     const progress = media.resumeProgress || watchProgressStore.getProgress(media.id, media.media_type);
     
-    if (media.media_type === 'movie' || media.title) {
+    if (media.media_type === 'movie') {
       // Movie: play from beginning (timestamp resume handled by VideoPlayer)
       await handlePlay(0, 0);
     } else if (progress && progress.currentSeason && progress.currentEpisode) {
@@ -678,6 +678,9 @@
         );
       }
 
+      // Check if this is a movie
+      const isMovie = media.media_type === 'movie' || !!details.title;
+      
       if (fileIndex !== -1) {
         console.log("Found matching file at index:", fileIndex);
         const matchedFile = videoFiles[fileIndex];
@@ -692,7 +695,7 @@
         });
 
         // 4. Auto-assign ALL other video files that have episode numbers
-        if (videoFiles.length > 1) {
+        if (videoFiles.length > 1 && !isMovie) {
           console.log("Multi-episode torrent detected, auto-assigning all episodes");
           for (const file of videoFiles) {
             if (file.index === matchedFile.index) continue; // Skip the one we already saved
@@ -751,8 +754,25 @@
         startStream(torrent.magnet_link, matchedFile.index, handleId);
         showTorrentSelector = false;
       } else {
-        // Show manual file selection
-        showManualFileSelector(torrent, info, handleId);
+        // For movies with a single file, auto-select it without showing selector
+        if (isMovie && videoFiles.length === 1) {
+          console.log("Movie with single file, auto-selecting");
+          const singleFile = videoFiles[0];
+          
+          await invoke("save_torrent_selection", {
+            showId: details.id,
+            season: pendingPlayRequest.season,
+            episode: pendingPlayRequest.episode,
+            magnetLink: torrent.magnet_link,
+            fileIndex: singleFile.index,
+          });
+          
+          startStream(torrent.magnet_link, singleFile.index, handleId);
+          showTorrentSelector = false;
+        } else {
+          // Show manual file selection for TV shows or movies with multiple files
+          showManualFileSelector(torrent, info, handleId);
+        }
       }
     } catch (err) {
       console.error("Error processing selection:", err);

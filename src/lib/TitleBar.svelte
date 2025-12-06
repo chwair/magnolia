@@ -1,8 +1,10 @@
 <script>
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import SearchBar from "./SearchBar.svelte";
+  import SettingsPanel from "./SettingsPanel.svelte";
 
   export let searchActive = false;
+  export let settingsActive = false;
   export let accentColor = null;
   export let immersive = false;
 
@@ -69,11 +71,21 @@
         <SearchBar bind:searchActive />
       {/if}
     </div>
+    <div class="titlebar-right">
+      {#if !immersive}
+        <SettingsPanel bind:settingsActive />
+      {/if}
+    </div>
   {:else}
     <div class="titlebar-left">
       <div class="logo"></div>
       {#if !immersive}
         <SearchBar bind:searchActive />
+      {/if}
+    </div>
+    <div class="titlebar-right">
+      {#if !immersive}
+        <SettingsPanel bind:settingsActive />
       {/if}
     </div>
     <div class="titlebar-controls windows window-controls">
